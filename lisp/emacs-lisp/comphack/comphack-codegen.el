@@ -608,22 +608,30 @@ unique delimiter to avoid conflicts."
                               (list (comp-args-min args) (comp-args-max args)))
                              ((comp-nargs-p args)
                               (list (comp-nargs-min args) (comp-nargs-nonrest args)))
-                             ((listp args) args)
+                             ((listp args)
+                              ;; Lambda list - compute arity from length
+                              (let ((len (length args)))
+                                (list len len)))
                              (t (error "Unknown args type for function %s: %S" name args))))
                 (min-args (car args-clean))
                 (max-args (cadr args-clean))
                 (has-rest-args (compc-func-has-rest-args-p func))
                 ;; If function has rest args, max-args should be MANY (-2)
                 (effective-max-args (if has-rest-args -2 max-args))
-                (name-idx (gethash name d-ephemeral-idx))
+                ;; Try both raw and bare symbol for lookup since hash may use either
+                (name-idx (or (gethash name d-ephemeral-idx)
+                              (gethash name-raw d-ephemeral-idx)))
                 (c-name-idx (gethash c-name d-ephemeral-idx)))
 
-           (when (and name-idx c-name-idx)
-             (compc-insert-line
-              (format "REGISTER_SUBR (%d, %d, %d, %d, %d);  /* %s */"
-                      name-idx c-name-idx
-                      (or min-args 0) (or effective-max-args -1)
-                      (1+ c-name-idx) name))))))
+           (unless (and name-idx c-name-idx)
+             (error "Failed to find indices for function %s: name-idx=%S c-name-idx=%S"
+                    name name-idx c-name-idx))
+
+           (compc-insert-line
+            (format "REGISTER_SUBR (%d, %d, %d, %d, %d);  /* %s */"
+                    name-idx c-name-idx
+                    (or min-args 0) (or effective-max-args -1)
+                    (1+ c-name-idx) name)))))
 
      (insert "\n")
      (compc-insert-line "return Qt;"))))
