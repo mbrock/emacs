@@ -89,7 +89,12 @@ Uses Emacs's native-compile in dry-run mode to capture the IR."
 (defun comphack--clean-insn (insn)
   "Remove unprintable objects from INSN for serialization."
   (cond
-   ((comp-mvar-p insn) (comp-mvar-slot insn))
+   ((comp-mvar-p insn)
+    ;; For mvars with constants, return the constant; otherwise return the slot
+    (or (when-let ((valset (comp-cstr-valset insn)))
+          (and (= (length valset) 1)
+               (car valset)))
+        (comp-mvar-slot insn)))
    ((proper-list-p insn)
     (mapcar #'comphack--clean-insn insn))
    (t insn)))
