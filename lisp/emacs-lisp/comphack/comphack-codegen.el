@@ -625,7 +625,9 @@ unique delimiter to avoid conflicts."
                             (gethash c-name lambda-impure-idx))))
 
            ;; Register both named and anonymous functions
-           (when (or name reloc-idx)
+           ;; Skip if it's a lambda without c-name in ephemeral (optimized away)
+           (when (and (or name reloc-idx)
+                      (or name (gethash c-name d-ephemeral-idx)))
 
               (let* ((args-clean (cond
                                   ((comp-args-p args)
