@@ -87,25 +87,70 @@ Uses Emacs's native-compile in dry-run mode to capture the IR."
 ;;; Minimal Context Extraction
 
 (defun comphack--clean-insn (insn)
-  "Remove unprintable objects from INSN for serialization."
+  "Remove unprintable objects from INSN for serialization.
+Returns either a slot number, a constant value wrapper, or a plist representation."
   (cond
    ((comp-mvar-p insn)
-    ;; If mvar has a slot, use the slot number (it's a variable)
-    ;; Only use constant value if there's no slot (pure constant)
-    (or (comp-mvar-slot insn)
-        (when-let ((valset (comp-cstr-valset insn)))
-          (and (= (length valset) 1)
-               (car valset)))))
+    ;; If mvar has a slot, use the slot number or symbol (e.g., 'scratch')
+    (let ((slot (comp-mvar-slot insn)))
+      (if slot
+          slot
+        ;; No slot - check if it's a constant (comp-cstr-imm is set by make--comp-mvar)
+        (let ((const-val (comp-cstr-imm insn)))
+          (if const-val
+              ;; Wrap constant in mvar plist to distinguish from slot numbers
+              `(mvar :val ,const-val)
+            ;; Fallback: try valset
+            (let ((valset (comp-cstr-valset insn)))
+              (if (and valset (= (length valset) 1))
+                  (let ((val (car valset)))
+                    ;; Only treat as constant if it's a known constant type
+                    (if (or (null val)        ; nil
+                            (eq val t)         ; t
+                            (numberp val)      ; numbers
+                            (stringp val)      ; strings
+                            (vectorp val)      ; vectors
+                            (consp val))       ; conses
+                        ;; Wrap in mvar plist
+                        `(mvar :val ,val)
+                      ;; Symbol but not a known constant - keep as mvar representation
+                      `(mvar :val ,val)))
+                ;; No clear constant value - keep minimal mvar info
+                `(mvar :val nil))))))))
    ((proper-list-p insn)
     (mapcar #'comphack--clean-insn insn))
    (t insn)))
 
+(defun comphack--strip-positions (obj)
+  "Strip position info from OBJ if it's a symbol-with-pos.
+For other types, return OBJ unchanged. This is used for hash table keys."
+  (if (symbol-with-pos-p obj)
+      (bare-symbol obj)
+    obj))
+
 (defun comphack--extract-data-container (container)
   "Extract serialized data from CONTAINER.
 Returns cons of (vector . index-hash) mapping objects to indices.
-Preserves both the ordering and indexing computed by `comp--finalize-relocs'."
+Preserves both the ordering and indexing computed by `comp--finalize-relocs'.
+Strips position info from symbols-with-pos keys for proper lookup.
+When multiple keys with different positions map to the same bare key,
+keeps only the first one (smallest integer index)."
   (let* ((objects (vconcat (comp-data-container-l container)))
-         (idx-map (copy-hash-table (comp-data-container-idx container))))
+         (old-idx-map (comp-data-container-idx container))
+         (idx-map (make-hash-table :test (hash-table-test old-idx-map)
+                                    :size (hash-table-count old-idx-map))))
+    ;; Rebuild index hash table with bare symbols as keys (recursively)
+    ;; Keep only integer values and the first occurrence when there are duplicates
+    (maphash
+     (lambda (key value)
+       (when (integerp value)  ; Only include integer indices
+         (let ((bare-key (comphack--strip-positions key)))
+           ;; Only add if not already present, or if this value is smaller
+           (let ((existing (gethash bare-key idx-map)))
+             (when (or (null existing)
+                       (< value existing))
+               (puthash bare-key value idx-map))))))
+     old-idx-map)
     (cons objects idx-map)))
 
 (defun comphack--simplify-ctxt (ctxt)

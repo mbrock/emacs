@@ -85,8 +85,7 @@
   "Select which backend implementation drives native compilation."
   :type '(choice (const :tag "libgccjit" gccjit)
                  (const :tag "comphack" comphack))
-  :group 'comp-common
-  :set #'native-comp--set-backend)
+  :group 'comp-common)
 
 (defcustom native-comp-verbose 0
   "Compiler verbosity for native compilation, a number between 0 and 3.

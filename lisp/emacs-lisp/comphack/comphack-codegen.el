@@ -18,6 +18,15 @@
 (declare-function comp-mvar-const "comp")
 (declare-function comphack-get-abi-hash "comphack")
 
+;;; Helper Functions
+
+(defun compc--strip-positions (obj)
+  "Strip position info from OBJ if it's a symbol-with-pos.
+For other types, return OBJ unchanged. This is used for hash table keys."
+  (if (symbol-with-pos-p obj)
+      (bare-symbol obj)
+    obj))
+
 ;;; Configuration
 
 (defconst compc--pseudo-subr-map
@@ -125,6 +134,8 @@ Uses d_reloc when the value lives in the default data vector."
     (`t "Qt")
     ((pred integerp)
      (format "make_fixnum (%d)" val))
+    ((pred vectorp)
+     (error "Unimplemented: vector literals not yet supported in immediates: %S" val))
     ;; Direct call to create a closure: (direct-call "C-name" slot1 slot2 ...)
     (`(direct-call ,c-name . ,closure-slots)
      (if closure-slots
@@ -133,16 +144,22 @@ Uses d_reloc when the value lives in the default data vector."
            (format "%s (%s)" c-name args-str))
        (format "%s ()" c-name)))
     (_
-     (let ((idx (and compc--d-default-idx (gethash val compc--d-default-idx))))
+     ;; Recursively strip position info before lookup
+     (let* ((bare-val (compc--strip-positions val))
+            (idx (and compc--d-default-idx
+                      (gethash bare-val compc--d-default-idx))))
        (cond
         (idx
          (format "RELOC (%d)" idx))
         ((and compc--d-impure-idx
-              (setq idx (gethash val compc--d-impure-idx)))
+              (setq idx (gethash bare-val compc--d-impure-idx)))
          (format "RELOC_IMP (%d)" idx))
         ((and compc--d-ephemeral-idx
-              (setq idx (gethash val compc--d-ephemeral-idx)))
+              (setq idx (gethash bare-val compc--d-ephemeral-idx)))
          (format "RELOC_EPH (%d)" idx))
+        ;; For plain symbols not in any reloc array, intern them
+        ((symbolp bare-val)
+         (format "intern_c_string (\"%s\")" (symbol-name bare-val)))
         (t
          (error "Immediate not found in any reloc idx: %S" val)))))))
 
@@ -152,17 +169,24 @@ Uses d_reloc when the value lives in the default data vector."
     ((pred integerp)
      (format "s%d" mvar))
 
+    ;; Special case: 'scratch' symbol means use scratch variable
+    ((pred (lambda (x) (eq x 'scratch)))
+     "scratch")
+
     (`(mvar . ,plist)
      (let ((slot (plist-get plist :slot))
            (val (plist-get plist :val)))
-       (if slot
-           (format "s%d" slot)
-         (compc-immediate-to-c val))))
+       (cond
+        ((eq slot 'scratch) "scratch")  ; Special scratch slot
+        (slot (format "s%d" slot))
+        (t (compc-immediate-to-c val)))))
 
     ((and mv (pred comp-mvar-p))
-     (if (comp-mvar-slot mv)
-         (format "s%d" (comp-mvar-slot mv))
-       (compc-immediate-to-c (comp-mvar-const mv))))
+     (let ((slot (comp-mvar-slot mv)))
+       (cond
+        ((eq slot 'scratch) "scratch")  ; Special scratch slot
+        (slot (format "s%d" slot))
+        (t (compc-immediate-to-c (comp-mvar-const mv))))))
 
     (_ (compc-immediate-to-c mvar))))
 
@@ -327,14 +351,20 @@ If DST is non-nil, assigns result to DST."
      (let ((cmp-val (cond
                      ((null cmp) nil)
                      ((comp-mvar-p cmp) (comp-mvar-const cmp))
+                     ;; Extract value from (mvar :val VALUE) plist
+                     ((and (listp cmp) (eq (car cmp) 'mvar))
+                      (plist-get (cdr cmp) :val))
                      (t cmp))))
        (if (null cmp-val)
+           ;; Comparing to nil: !test means test is nil/false
            (format "if (!%s)\n  goto %s;\nelse\n  goto %s;"
                    (compc-mvar-to-c test)
                    true-bb
                    false-bb)
-         (format "if (%s)\n  goto %s;\nelse\n  goto %s;"
+         ;; Comparing to non-nil value: need explicit comparison
+         (format "if (%s == %s)\n  goto %s;\nelse\n  goto %s;"
                  (compc-mvar-to-c test)
+                 (compc-immediate-to-c cmp-val)
                  true-bb
                  false-bb))))
 
@@ -366,6 +396,12 @@ If DST is non-nil, assigns result to DST."
          (format "%s = Qnil; /* ERROR: no slot for rest args, dst=%S */"
                  (compc-mvar-to-c dst) dst))))
 
+    (`(cond-jump-narg-leq ,n ,true-bb ,false-bb)
+     ;; Jump based on number of arguments
+     ;; if (nargs <= n) goto true-bb; else goto false-bb;
+     (format "if (nargs <= %d)\n  goto %s;\nelse\n  goto %s;"
+             n true-bb false-bb))
+
     (`(phi ,dst . ,_)
      ;; PHI nodes generate no code - handled by patching predecessor blocks
      nil)
@@ -374,7 +410,23 @@ If DST is non-nil, assigns result to DST."
      ;; Assume instructions generate no code - purely for type analysis
      nil)
 
-    (_ (format "/* TODO: %S */" insn))))
+    (`(unreachable)
+     ;; Unreachable code marker - no code generation needed
+     "/* unreachable */")
+
+    (`(push-handler ,_type ,_handler-num ,_true-bb ,_false-bb)
+     ;; TODO: Exception handling not yet implemented
+     "/* UNIMPLEMENTED: push-handler */")
+
+    (`(pop-handler)
+     ;; TODO: Exception handling not yet implemented
+     "/* UNIMPLEMENTED: pop-handler */")
+
+    (`(fetch-handler ,_)
+     ;; TODO: Exception handling not yet implemented
+     "/* UNIMPLEMENTED: fetch-handler */")
+
+    (_ (error "Unknown instruction: %S" insn))))
 
 ;;; Block and Function Generation
 
@@ -486,6 +538,17 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
 
       (compc-with-block
        (compc-insert-line "struct freloc_link_table *fn = freloc_link_table;")
+
+      ;; Check if function uses scratch variable
+      (let ((uses-scratch (cl-some
+                           (lambda (block)
+                             (cl-some (lambda (insn)
+                                        (and (listp insn)
+                                             (memq 'scratch (flatten-tree insn))))
+                                      (plist-get block :insns)))
+                           blocks)))
+        (when uses-scratch
+          (compc-insert-line "Lisp_Object scratch;")))
 
       (when (> frame-size 0)
         (insert "Lisp_Object ")
