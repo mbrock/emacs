@@ -37,6 +37,10 @@
 (require 'comp-common)
 (require 'comp-cstr)
 
+(defun comp--ensure-backend-runtime ()
+  "Ensure that the selected native compilation backend is loaded."
+  (native-comp--require-backend native-comp-backend))
+
 ;; These variables and functions are defined in comp.c
 (defvar comp-native-version-dir)
 (defvar comp-subr-arities-h)
@@ -3257,6 +3261,76 @@ Prepare every function for final compilation and drive the C back-end."
       (comp--compile-ctxt-to-file (comp-ctxt-output comp-ctxt))
     (comp--release-ctxt)))
 
+(defun comp--final-gccjit ()
+  ;; Always run the C side of the compilation as a sub-process
+  ;; unless during bootstrap or async compilation (bug#45056).  GCC
+  ;; leaks memory but also interfere with the ability of Emacs to
+  ;; detect when a sub-process completes (TODO understand why).
+  (if (or comp-running-batch-compilation comp-async-compilation)
+      (comp--final1)
+    ;; Call comp--final1 in a child process.
+    (let* ((output (comp-ctxt-output comp-ctxt))
+           (print-escape-newlines t)
+           (print-length nil)
+           (print-level nil)
+           (print-quoted t)
+           (print-gensym t)
+           (print-circle t)
+           (print-escape-multibyte t)
+           (expr `((require 'comp)
+                   (setf native-comp-verbose ,native-comp-verbose
+                         comp-libgccjit-reproducer ,comp-libgccjit-reproducer
+                         comp-ctxt ,comp-ctxt
+                         native-comp-eln-load-path ',native-comp-eln-load-path
+                         native-comp-compiler-options
+                         ',native-comp-compiler-options
+                         native-comp-driver-options
+                         ',native-comp-driver-options
+                         byte-compile-warnings ',byte-compile-warnings
+                         load-path ',load-path)
+                   ,native-comp-async-env-modifier-form
+                   (message "Compiling %s..." ',output)
+                   (comp--final1)))
+           (temp-file (make-temp-file
+                       (concat "emacs-int-comp-"
+                               (file-name-base output) "-")
+                       nil ".el"))
+           (default-directory invocation-directory))
+      (with-temp-file temp-file
+        (insert ";; -*-coding: utf-8-emacs-unix; -*-\n")
+        (mapc (lambda (e)
+                (insert (prin1-to-string e)))
+              expr))
+      (with-temp-buffer
+        (unwind-protect
+            (if (zerop
+                 (call-process (expand-file-name invocation-name
+                                                 invocation-directory)
+                               nil t t "-no-comp-spawn" "-Q" "--batch" "-l"
+                               temp-file))
+                (progn
+                  (delete-file temp-file)
+                  output)
+              (signal 'native-compiler-error (list (buffer-string))))
+          (comp-log-to-buffer (buffer-string)))))))
+
+(defun comp--final-comphack ()
+  (comp--ensure-backend-runtime)
+  (let* ((output (comp-ctxt-output comp-ctxt))
+         (default-src (or (and (boundp 'source-directory)
+                               (expand-file-name "src" source-directory))
+                          (expand-file-name "../src" invocation-directory))))
+    (unless output
+      (error "No destination file for comphack compilation"))
+    (let ((comphack-emacs-source-dir
+           (or (and (boundp 'comphack-emacs-source-dir)
+                    comphack-emacs-source-dir
+                    (file-exists-p comphack-emacs-source-dir)
+                    comphack-emacs-source-dir)
+               (and (getenv "EMACS_SRC") (getenv "EMACS_SRC"))
+               default-src)))
+      (comphack-compile-comp-ctxt comp-ctxt output))))
+
 (defvar comp-async-compilation nil
   "Non-nil while executing an asynchronous native compilation.")
 
@@ -3266,57 +3340,9 @@ Prepare every function for final compilation and drive the C back-end."
 (defun comp--final (_)
   "Final pass driving the C back-end for code emission."
   (unless comp-dry-run
-    ;; Always run the C side of the compilation as a sub-process
-    ;; unless during bootstrap or async compilation (bug#45056).  GCC
-    ;; leaks memory but also interfere with the ability of Emacs to
-    ;; detect when a sub-process completes (TODO understand why).
-    (if (or comp-running-batch-compilation comp-async-compilation)
-	(comp--final1)
-      ;; Call comp--final1 in a child process.
-      (let* ((output (comp-ctxt-output comp-ctxt))
-             (print-escape-newlines t)
-             (print-length nil)
-             (print-level nil)
-             (print-quoted t)
-             (print-gensym t)
-             (print-circle t)
-             (print-escape-multibyte t)
-             (expr `((require 'comp)
-                     (setf native-comp-verbose ,native-comp-verbose
-                           comp-libgccjit-reproducer ,comp-libgccjit-reproducer
-                           comp-ctxt ,comp-ctxt
-                           native-comp-eln-load-path ',native-comp-eln-load-path
-                           native-comp-compiler-options
-                           ',native-comp-compiler-options
-                           native-comp-driver-options
-                           ',native-comp-driver-options
-                           byte-compile-warnings ',byte-compile-warnings
-                           load-path ',load-path)
-                     ,native-comp-async-env-modifier-form
-                     (message "Compiling %s..." ',output)
-                     (comp--final1)))
-             (temp-file (make-temp-file
-			 (concat "emacs-int-comp-"
-				 (file-name-base output) "-")
-			 nil ".el"))
-             (default-directory invocation-directory))
-	(with-temp-file temp-file
-          (insert ";; -*-coding: utf-8-emacs-unix; -*-\n")
-          (mapc (lambda (e)
-                  (insert (prin1-to-string e)))
-                expr))
-	(with-temp-buffer
-          (unwind-protect
-              (if (zerop
-                   (call-process (expand-file-name invocation-name
-                                                   invocation-directory)
-				 nil t t "-no-comp-spawn" "-Q" "--batch" "-l"
-                                 temp-file))
-                  (progn
-                    (delete-file temp-file)
-                    output)
-		(signal 'native-compiler-error (list (buffer-string))))
-            (comp-log-to-buffer (buffer-string))))))))
+    (pcase native-comp-backend
+      ('comphack (comp--final-comphack))
+      (_ (comp--final-gccjit)))))
 
 
 ;;; Compiler type hints.
@@ -3469,6 +3495,7 @@ This serves as internal implementation of `native-compile' but
 allowing for WITH-LATE-LOAD to be controlled is in use also for
 the deferred compilation mechanism."
   (comp-ensure-native-compiler)
+  (comp--ensure-backend-runtime)
   (unless (or (functionp function-or-file)
               (stringp function-or-file))
     (signal 'native-compiler-error

@@ -28,6 +28,7 @@
 ;;; Code:
 
 (eval-when-compile (require 'cl-lib))
+(require 'subr-x)
 
 ;; These variables and functions are defined in comp.c
 (defvar comp-native-version-dir)
@@ -36,6 +37,56 @@
 (defgroup comp-common nil
   "Emacs Lisp native compiler common code."
   :group 'lisp)
+
+(defconst native-comp-default-backend
+  (if (boundp 'native-comp-configured-backend)
+      native-comp-configured-backend
+    'gccjit))
+
+(defconst native-comp-available-backends '(gccjit comphack))
+
+(defconst native-comp--configured-comphack-cc
+  (if (boundp 'native-comp-configured-comphack-cc)
+      native-comp-configured-comphack-cc
+    "cc"))
+
+(defconst native-comp--configured-comphack-cc-flags
+  (if (boundp 'native-comp-configured-comphack-cc-flags)
+      native-comp-configured-comphack-cc-flags
+    ""))
+
+(defun native-comp--split-flag-string (flags)
+  (when (and flags (not (string-empty-p flags)))
+    (split-string flags "[ \t]+" t)))
+
+(defun native-comp--coerce-backend (value)
+  (if (symbolp value)
+      value
+    (intern (format "%s" value))))
+
+(defun native-comp--require-backend (backend)
+  (pcase backend
+    ('comphack
+     (unless (featurep 'comphack)
+       (load "emacs-lisp/comphack/comphack" nil t)))
+    (_ nil)))
+
+(defun native-comp--set-backend (symbol value)
+  (let ((backend (native-comp--coerce-backend value)))
+    (unless (memq backend native-comp-available-backends)
+      (error "Native compilation backend %s is not available on this build" backend))
+    (set-default symbol backend)
+    (native-comp--require-backend backend)))
+
+(defcustom native-comp-backend
+  (or (and (boundp 'native-comp-default-backend)
+           native-comp-default-backend)
+      'gccjit)
+  "Select which backend implementation drives native compilation."
+  :type '(choice (const :tag "libgccjit" gccjit)
+                 (const :tag "comphack" comphack))
+  :group 'comp-common
+  :set #'native-comp--set-backend)
 
 (defcustom native-comp-verbose 0
   "Compiler verbosity for native compilation, a number between 0 and 3.
@@ -67,6 +118,17 @@ Used to modify the compiler environment."
   :type 'sexp
   :risky t
   :version "28.1")
+
+(defcustom native-comp-comphack-cc native-comp--configured-comphack-cc
+  "Compiler executable invoked by the comphack backend."
+  :type 'file
+  :group 'comp-common)
+
+(defcustom native-comp-comphack-extra-flags
+  (native-comp--split-flag-string native-comp--configured-comphack-cc-flags)
+  "Additional compiler flags appended when using the comphack backend."
+  :type '(repeat (string :tag "Flag"))
+  :group 'comp-common)
 
 (defconst comp-primitive-type-specifiers
   `(
@@ -476,14 +538,17 @@ with `message'.  Otherwise, log with `comp-log-to-buffer'."
           (goto-char (point-max)))))))
 
 (defun comp-ensure-native-compiler ()
-  "Make sure Emacs has native compiler support and libgccjit can be loaded.
+  "Make sure Emacs has native compiler support for the selected backend.
 Signal an error otherwise.
 To be used by all entry points."
   (cond
    ((null (featurep 'native-compile))
     (error "Emacs was not compiled with native compiler support (--with-native-compilation)"))
-   ((null (native-comp-available-p))
-    (error "Cannot find libgccjit library"))))
+   ((not (memq native-comp-backend native-comp-available-backends))
+    (error "Native compilation backend %s is not supported in this build" native-comp-backend))
+   ((and (eq native-comp-backend 'gccjit)
+         (null (native-comp-available-p)))
+    (error "Cannot load libgccjit for the native compiler backend"))))
 
 (defun comp-trampoline-filename (subr-name)
   "Given SUBR-NAME return the filename containing the trampoline."

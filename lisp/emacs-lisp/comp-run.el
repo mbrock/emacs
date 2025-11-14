@@ -244,7 +244,7 @@ display a message."
                            (setq comp-async-compilation t
                                  warning-fill-column most-positive-fixnum)
                            ,(let ((set (list 'setq)))
-                              (dolist (var '(comp-file-preloaded-p
+                             (dolist (var '(comp-file-preloaded-p
                                              native-compile-target-directory
                                              native-comp-speed
                                              native-comp-debug
@@ -253,6 +253,9 @@ display a message."
                                              native-comp-eln-load-path
                                              native-comp-compiler-options
                                              native-comp-driver-options
+                                             native-comp-backend
+                                             native-comp-comphack-cc
+                                             native-comp-comphack-extra-flags
                                              load-path
                                              backtrace-line-length
                                              byte-compile-warnings

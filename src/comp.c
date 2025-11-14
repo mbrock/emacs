@@ -471,6 +471,18 @@ load_gccjit_if_necessary (bool mandatory)
 /* Increase this number to force a new Vcomp_abi_hash to be generated.  */
 #define ABI_VERSION "6"
 
+#ifndef NATIVE_COMP_DEFAULT_BACKEND
+# define NATIVE_COMP_DEFAULT_BACKEND "gccjit"
+#endif
+
+#ifndef COMPHACK_DEFAULT_CC
+# define COMPHACK_DEFAULT_CC "cc"
+#endif
+
+#ifndef COMPHACK_DEFAULT_CC_FLAGS
+# define COMPHACK_DEFAULT_CC_FLAGS ""
+#endif
+
 /* Length of the hashes used for eln file naming.  */
 #define HASH_LENGTH 8
 
@@ -5879,6 +5891,23 @@ Emacs.  */);
      `invocation-directory' is still unset, will be fixed up during
      dump reload.  */
   Vnative_comp_eln_load_path = Fcons (build_string ("../native-lisp/"), Qnil);
+
+  DEFVAR_LISP ("native-comp-configured-backend",
+	       Vnative_comp_configured_backend,
+    doc: /* Backend selected at configure time for native compilation.  */);
+  Vnative_comp_configured_backend =
+    intern_c_string (NATIVE_COMP_DEFAULT_BACKEND);
+
+  DEFVAR_LISP ("native-comp-configured-comphack-cc",
+	       Vnative_comp_configured_comphack_cc,
+    doc: /* Compiler command configured for the comphack backend.  */);
+  Vnative_comp_configured_comphack_cc = build_string (COMPHACK_DEFAULT_CC);
+
+  DEFVAR_LISP ("native-comp-configured-comphack-cc-flags",
+	       Vnative_comp_configured_comphack_cc_flags,
+    doc: /* Compiler flags configured for the comphack backend.  */);
+  Vnative_comp_configured_comphack_cc_flags =
+    build_string (COMPHACK_DEFAULT_CC_FLAGS);
 
   DEFVAR_LISP ("native-comp-enable-subr-trampolines",
 	       Vnative_comp_enable_subr_trampolines,

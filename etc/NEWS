@@ -25,6 +25,16 @@ compilation, configure Emacs with the option:
 
     ./configure --with-native-compilation=no
 
+** New configure option '--with-native-compilation-backend=BACKEND'.
+The default backend remains 'gccjit', but you can now select the
+alternative 'comphack' backend, which emits C from Emacs and invokes an
+external compiler instead of linking against libgccjit.  This is useful
+on builds where libgccjit is unavailable, such as Fil-C based systems.
+Runtime selection is also possible through the user option
+'native-comp-backend', and the comphack-specific compiler command and
+flags can be customized via 'native-comp-comphack-cc' and
+'native-comp-comphack-extra-flags'.
+
 ** Emacs has been ported to the Android operating system.
 This requires Emacs to be compiled on another computer.  The Android
 NDK, SDK, and a suitable Java compiler must also be installed.

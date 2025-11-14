@@ -292,6 +292,17 @@ build ("ahead of time"), use the 'configure' option
 Lisp code even if your system satisfies the build requirements, use the
 'configure' option '--with-native-compilation=no'.
 
+On platforms where 'libgccjit' is unavailable, you can still enable
+native compilation by selecting the alternative "comphack" backend:
+
+    ./configure --with-native-compilation-backend=comphack
+
+This backend emits C code and invokes an external compiler instead of
+linking against 'libgccjit'.  When using it you can direct Emacs to a
+particular compiler (for example, a Fil-C compatible clang) using
+'--with-comphack-cc=PROGRAM' and provide additional compiler switches
+with '--with-comphack-cc-flags=FLAGS'.
+
 DETAILED BUILDING AND INSTALLATION:
 
 (This is for a Unix or Unix-like system.  For GNUstep and macOS,

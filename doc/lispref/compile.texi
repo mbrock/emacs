@@ -1050,6 +1050,29 @@ Maximum verbosity: log everything.
 @end table
 @end defopt
 
+@defopt native-comp-backend
+This option selects the backend implementation used to produce native
+code.  The value should be either the symbol @code{gccjit}, which uses
+the @file{libgccjit} library (the default), or @code{comphack}, which
+emits C source via the comphack code generator and invokes an external
+compiler.  The default value is determined by the configure option
+@code{--with-native-compilation-backend}.
+@end defopt
+
+@defopt native-comp-comphack-cc
+This option names the compiler executable that the comphack backend
+should run when @code{native-comp-backend} is @code{comphack}.  Its
+default value comes from the configure option @code{--with-comphack-cc}
+and otherwise falls back to @code{"cc"}.
+@end defopt
+
+@defopt native-comp-comphack-extra-flags
+This option holds additional compiler flags that Emacs should append
+after its own default arguments when @code{native-comp-backend} is
+@code{comphack}.  The default value is derived from the
+@code{--with-comphack-cc-flags} configure option.
+@end defopt
+
 @defopt native-comp-async-jobs-number
 This variable determines the maximum number of native-compilation
 subprocesses that will be started simultaneously.  It should be a

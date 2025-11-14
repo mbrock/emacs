@@ -81,4 +81,16 @@
       (dolist (f (list f1 f2 f3 f4))
 	(should (file-regular-p f))))))
 
+(ert-deftest comp-native-backend-selection ()
+  (skip-unless (featurep 'native-compile))
+  (let ((orig native-comp-backend))
+    (unwind-protect
+        (progn
+          (native-comp--set-backend 'native-comp-backend 'comphack)
+          (should (eq native-comp-backend 'comphack))
+          (native-comp--set-backend 'native-comp-backend 'gccjit)
+          (should (eq native-comp-backend 'gccjit)))
+      (native-comp--set-backend 'native-comp-backend orig))))
+
+
 ;;; comp-tests.el ends here
