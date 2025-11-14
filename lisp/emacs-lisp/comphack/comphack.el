@@ -90,11 +90,12 @@ Uses Emacs's native-compile in dry-run mode to capture the IR."
   "Remove unprintable objects from INSN for serialization."
   (cond
    ((comp-mvar-p insn)
-    ;; For mvars with constants, return the constant; otherwise return the slot
-    (or (when-let ((valset (comp-cstr-valset insn)))
+    ;; If mvar has a slot, use the slot number (it's a variable)
+    ;; Only use constant value if there's no slot (pure constant)
+    (or (comp-mvar-slot insn)
+        (when-let ((valset (comp-cstr-valset insn)))
           (and (= (length valset) 1)
-               (car valset)))
-        (comp-mvar-slot insn)))
+               (car valset)))))
    ((proper-list-p insn)
     (mapcar #'comphack--clean-insn insn))
    (t insn)))
@@ -110,11 +111,37 @@ Preserves both the ordering and indexing computed by `comp--finalize-relocs'."
 (defun comphack--simplify-ctxt (ctxt)
   "Extract minimal compilation context from COMP-CTXT.
 Returns plist with only fields needed for C generation."
-  ;; Finalize relocations to populate data container lists
+  ;; Finalize relocations first to populate data container lists
   (let ((comp-ctxt ctxt))
     (comp--finalize-relocs))
 
-  (let ((funcs-list nil))
+  ;; AFTER finalize-relocs, use lambda-fixups-h to get lambda → d-impure-idx mapping
+  ;; lambda-fixups-h maps byte-func → reloc-mvar, we need c-name → reloc-idx (integer)
+  (let ((lambda-impure-idx (make-hash-table :test 'equal)))
+    (maphash
+     (lambda (c-name func)
+       (when-let ((byte-func (comp-func-byte-func func)))
+         ;; Look up this byte-func in lambda-fixups-h
+         (when-let ((reloc-mvar (gethash byte-func (comp-ctxt-lambda-fixups-h ctxt))))
+           ;; Extract integer index from comp-mvar
+           ;; Check slot first, then valset, then range
+           (let ((idx (or (comp-mvar-slot reloc-mvar)
+                          (and (comp-cstr-valset reloc-mvar)
+                               (car (comp-cstr-valset reloc-mvar)))
+                          (and (comp-cstr-range reloc-mvar)
+                               (car (car (comp-cstr-range reloc-mvar)))))))
+             (when idx
+               (puthash c-name idx lambda-impure-idx))))))
+     (comp-ctxt-funcs-h ctxt))
+
+    (let ((funcs-list nil)
+          (function-docs (comp-ctxt-function-docs ctxt))
+          (doc-to-idx (make-hash-table :test 'equal)))
+
+    ;; Build reverse mapping from doc-string to doc-idx
+    ;; function-docs is a vector where index is doc-idx
+    (dotimes (idx (length function-docs))
+      (puthash (aref function-docs idx) idx doc-to-idx))
 
     ;; Extract all functions
     (maphash
@@ -135,16 +162,20 @@ Returns plist with only fields needed for C generation."
                   blocks-list))
           (comp-func-blocks func))
 
-         (push (list :c-name c-name
-                    :name (comp-func-name func)
-                    :args (if (comp-func-l-p func)
-                              (comp-func-l-args func)
-                            (comp-func-d-lambda-list func))
-                    :frame-size (comp-func-frame-size func)
-                    :speed (comp-func-speed func)
-                    :pure (comp-func-pure func)
-                    :blocks (nreverse blocks-list))
-               funcs-list)))
+         (let ((doc (comp-func-doc func)))
+           (push (list :c-name c-name
+                      :name (comp-func-name func)
+                      :args (if (comp-func-l-p func)
+                                (comp-func-l-args func)
+                              (comp-func-d-lambda-list func))
+                      :frame-size (comp-func-frame-size func)
+                      :speed (comp-func-speed func)
+                      :pure (comp-func-pure func)
+                      :doc-idx (gethash doc doc-to-idx)
+                      :int-spec (comp-func-int-spec func)
+                      :command-modes (comp-func-command-modes func)
+                      :blocks (nreverse blocks-list))
+                 funcs-list))))
      (comp-ctxt-funcs-h ctxt))
 
     ;; Extract data containers
@@ -162,10 +193,11 @@ Returns plist with only fields needed for C generation."
             :d-impure-idx (cdr d-impure)
             :d-ephemeral (car d-ephemeral)
             :d-ephemeral-idx (cdr d-ephemeral)
+            :lambda-impure-idx lambda-impure-idx
             :function-docs (comp-ctxt-function-docs ctxt)
             :speed (comp-ctxt-speed ctxt)
             :debug (comp-ctxt-debug ctxt)
-            :compiler-options (comp-ctxt-compiler-options ctxt)))))
+            :compiler-options (comp-ctxt-compiler-options ctxt))))))
 
 ;;; Public API
 

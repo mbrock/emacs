@@ -175,10 +175,25 @@ Returns cons (min . max) or nil if not found."
           (subr-arity (symbol-function sym))))
     (error nil)))
 
+(defun compc--add-default-args (func-name args)
+  "Add default arguments for functions that need them.
+Some runtime functions are called with fewer arguments in LIMPLE,
+relying on default values for omitted arguments."
+  (cond
+   ;; set_internal (symbol, newval, where, bindflag)
+   ;; When called with 2 args, defaults are: Qnil, SET_INTERNAL_SET
+   ((and (equal func-name "set_internal") (= (length args) 2))
+    (append args '("Qnil" "SET_INTERNAL_SET")))
+
+   ;; Default: return args unchanged
+   (t args)))
+
 (defun compc-freloc-call (func-name args &optional dst)
   "Generate freloc function call for FUNC-NAME with ARGS.
 If DST is non-nil, assigns result to DST."
-  (let ((canonical-name (compc--canonicalize-func-name func-name)))
+  (let* ((canonical-name (compc--canonicalize-func-name func-name))
+         ;; Add default arguments if needed
+         (args (compc--add-default-args canonical-name args)))
     (if (compc--helper-name-p canonical-name)
         (compc--format-helper-call canonical-name args dst)
       (let* ((arity (compc-get-subr-arity canonical-name))
@@ -584,7 +599,8 @@ unique delimiter to avoid conflicts."
   "Insert top_level_run entry point from MINIMAL context."
   (let ((functions (plist-get minimal :functions))
         (d-default-idx (plist-get minimal :d-default-idx))
-        (d-ephemeral-idx (plist-get minimal :d-ephemeral-idx)))
+        (d-ephemeral-idx (plist-get minimal :d-ephemeral-idx))
+        (lambda-impure-idx (plist-get minimal :lambda-impure-idx)))
 
     (compc-insert-line "/* Entry point */")
     (compc-insert-line "Lisp_Object top_level_run (Lisp_Object comp_u)")
@@ -597,63 +613,82 @@ unique delimiter to avoid conflicts."
                           (equal (plist-get f :c-name) "top_level_run"))
                         functions)))
 
-       (let ((func-idx 0))
-        (dolist (func user-funcs)
-          (let* ((name-raw (plist-get func :name))
-                 (c-name (plist-get func :c-name))
-                 (args (plist-get func :args))
-                 (name (if (symbol-with-pos-p name-raw)
-                           (bare-symbol name-raw)
-                         name-raw))
-                 (args-clean (cond
-                              ((comp-args-p args)
-                               (list (comp-args-min args) (comp-args-max args)))
-                              ((comp-nargs-p args)
-                               (list (comp-nargs-min args) (comp-nargs-nonrest args)))
-                              ((listp args)
-                               ;; Lambda list - compute arity from length
-                               (let ((len (length args)))
-                                 (list len len)))
-                              (t (error "Unknown args type for function %s: %S" name args))))
-                 (min-args (car args-clean))
-                 (max-args (cadr args-clean))
-                 (has-rest-args (compc-func-has-rest-args-p func))
-                 ;; If function has rest args, max-args should be MANY (-2)
-                 (effective-max-args (if has-rest-args -2 max-args))
-                 ;; Try both raw and bare symbol for lookup since hash may use either
-                 (name-idx (or (gethash name d-ephemeral-idx)
-                               (gethash name-raw d-ephemeral-idx)))
-                 (c-name-idx (gethash c-name d-ephemeral-idx))
-                 ;; Rest list is (doc-idx intspec command-modes)
-                 (rest-list (list func-idx nil nil))
-                 (rest-idx (gethash rest-list d-ephemeral-idx)))
+       (dolist (func user-funcs)
+         (let* ((name-raw (plist-get func :name))
+                (c-name (plist-get func :c-name))
+                (args (plist-get func :args))
+                (name (if (symbol-with-pos-p name-raw)
+                          (bare-symbol name-raw)
+                        name-raw))
+                (is-lambda (null name))  ; Anonymous functions have nil name
+                (reloc-idx (when is-lambda
+                            (gethash c-name lambda-impure-idx))))
 
-            (unless (and name-idx c-name-idx rest-idx)
-              (error "Failed to find indices for function %s: name-idx=%S c-name-idx=%S rest-idx=%S"
-                     name name-idx c-name-idx rest-idx))
+           ;; Register both named and anonymous functions
+           (when (or name reloc-idx)
 
-            ;; For dynamic functions (lambda-list), need to pass indices to arity cons and lambda-list
-            ;; For lexical functions, pass numeric min/max
-            (let ((minarg-code (format "make_fixnum (%d)" (or min-args 0)))
-                  (maxarg-code (format "make_fixnum (%d)" (or effective-max-args -1))))
-              (when (listp args)  ;; Dynamic function with lambda-list
-                ;; Look up arity cons (min . max) in ephemeral
-                (let ((arity-cons (cons min-args max-args)))
-                  (when-let ((arity-idx (gethash arity-cons d-ephemeral-idx)))
-                    (setq minarg-code (format "RELOC_EPH (%d)" arity-idx))))
-                ;; Look up lambda-list in default
-                (when-let ((lambda-list-idx (gethash args d-default-idx)))
-                  (setq maxarg-code (format "RELOC (%d)" lambda-list-idx))))
+              (let* ((args-clean (cond
+                                  ((comp-args-p args)
+                                   (list (comp-args-min args) (comp-args-max args)))
+                                  ((comp-nargs-p args)
+                                   (list (comp-nargs-min args) (comp-nargs-nonrest args)))
+                                  ((listp args)
+                                   ;; Lambda list - compute arity from length
+                                   (let ((len (length args)))
+                                     (list len len)))
+                                  (t (error "Unknown args type for function %s: %S" name args))))
+                     (min-args (car args-clean))
+                     (max-args (cadr args-clean))
+                     (has-rest-args (compc-func-has-rest-args-p func))
+                     ;; If function has rest args, max-args should be MANY (-2)
+                     (effective-max-args (if has-rest-args -2 max-args))
+                     ;; Try both raw and bare symbol for lookup since hash may use either
+                     (name-idx (or (gethash name d-ephemeral-idx)
+                                   (gethash name-raw d-ephemeral-idx)))
+                     (c-name-idx (gethash c-name d-ephemeral-idx))
+                     ;; Rest list is (doc-idx intspec command-modes)
+                     (doc-idx (plist-get func :doc-idx))
+                     (int-spec (plist-get func :int-spec))
+                     (command-modes (plist-get func :command-modes))
+                     (rest-list (list doc-idx int-spec command-modes))
+                     (rest-idx (gethash rest-list d-ephemeral-idx)))
 
-              (compc-insert-line
-               (format "fn->f_comp__register_subr(RELOC_EPH (%d), RELOC_EPH (%d), %s, %s, Qnil, RELOC_EPH (%d), comp_u);  /* %s */"
-                       name-idx c-name-idx
-                       minarg-code maxarg-code
-                       rest-idx name)))
-            (cl-incf func-idx)))))
+                ;; For lambdas we only need c-name-idx and rest-idx (no name-idx)
+                ;; For named functions we need all three
+                (unless (and c-name-idx rest-idx (or is-lambda name-idx))
+                  (error "Failed to find indices for function %s: name-idx=%S c-name-idx=%S rest-idx=%S"
+                         name name-idx c-name-idx rest-idx))
+
+                ;; For dynamic functions (lambda-list), need to pass indices to arity cons and lambda-list
+                ;; For lexical functions, pass numeric min/max
+                (let ((minarg-code (format "make_fixnum (%d)" (or min-args 0)))
+                      (maxarg-code (format "make_fixnum (%d)" (or effective-max-args -1))))
+                  (when (listp args)  ;; Dynamic function with lambda-list
+                    ;; Look up arity cons (min . max) in ephemeral
+                    (let ((arity-cons (cons min-args max-args)))
+                      (when-let ((arity-idx (gethash arity-cons d-ephemeral-idx)))
+                        (setq minarg-code (format "RELOC_EPH (%d)" arity-idx))))
+                    ;; Look up lambda-list in default
+                    (when-let ((lambda-list-idx (gethash args d-default-idx)))
+                      (setq maxarg-code (format "RELOC (%d)" lambda-list-idx))))
+
+                  ;; Generate appropriate registration call
+                  (if is-lambda
+                      ;; Anonymous lambda: comp--register-lambda(reloc_idx, c_name, min, max, type, rest, comp_u)
+                      (compc-insert-line
+                       (format "fn->f_comp__register_lambda(make_fixnum (%d), RELOC_EPH (%d), %s, %s, Qnil, RELOC_EPH (%d), comp_u);  /* anonymous lambda */"
+                               reloc-idx c-name-idx
+                               minarg-code maxarg-code
+                               rest-idx))
+                    ;; Named function: comp--register-subr(name, c_name, min, max, type, rest, comp_u)
+                    (compc-insert-line
+                     (format "fn->f_comp__register_subr(RELOC_EPH (%d), RELOC_EPH (%d), %s, %s, Qnil, RELOC_EPH (%d), comp_u);  /* %s */"
+                             name-idx c-name-idx
+                             minarg-code maxarg-code
+                             rest-idx name))))))))
 
      (insert "\n")
-     (compc-insert-line "return Qt;"))))
+     (compc-insert-line "return Qt;")))))
 
 ;;; Complete File Generation
 
@@ -850,6 +885,14 @@ static inline Lisp_Object make_fixnum(intptr_t n) {
 static inline intptr_t XFIXNUM(Lisp_Object a) {
     return a >> 2;
 }
+
+/* Enums for runtime functions */
+enum Set_Internal_Bind {
+    SET_INTERNAL_SET,
+    SET_INTERNAL_BIND,
+    SET_INTERNAL_UNBIND,
+    SET_INTERNAL_THREAD_SWITCH
+};
 
 /* Stubs */
 static inline Lisp_Object build_string(const char *str) {
