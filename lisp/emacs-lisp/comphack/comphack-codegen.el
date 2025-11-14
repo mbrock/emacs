@@ -635,8 +635,7 @@ Uses c-mode for proper GNU C coding style indentation."
       (font-lock-mode -1)
       (setq c-default-style "gnu")
 
-      ;; Includes
-      (compc-insert-line "#include \"comphack.h\"")
+      ;; Includes (comphack.h is now inlined in freloc header)
       (compc-insert-line (format "#include \"%s\"" freloc-h))
       (insert "\n")
 
@@ -794,8 +793,24 @@ Returns the filename of the freloc header (e.g., \"generated/freloc-2b8d5670.h\"
     (with-temp-file tmp-file
       (insert (format "#ifndef %s\n" guard-name))
       (insert (format "#define %s\n\n" guard-name))
-      (insert "#include \"../comphack.h\"\n\n")
       (insert (format "/* Generated for Emacs ABI hash: %s */\n\n" abi-hash))
+      ;; Inline comphack.h contents to avoid path issues
+      (let* ((comphack-h (expand-file-name "comphack.h" base-dir))
+             (content (with-temp-buffer
+                        (insert-file-contents comphack-h)
+                        ;; Strip header guards
+                        (goto-char (point-min))
+                        (when (re-search-forward "^#ifndef COMPHACK_H" nil t)
+                          (delete-region (line-beginning-position) (1+ (line-end-position))))
+                        (when (re-search-forward "^#define COMPHACK_H" nil t)
+                          (delete-region (line-beginning-position) (1+ (line-end-position))))
+                        (goto-char (point-max))
+                        (when (re-search-backward "^#endif /\\* COMPHACK_H \\*/" nil t)
+                          (delete-region (line-beginning-position) (1+ (line-end-position))))
+                        (buffer-string))))
+        (insert "/* Begin inlined comphack.h */\n")
+        (insert content)
+        (insert "/* End inlined comphack.h */\n\n"))
       (insert (compc-generate-freloc-struct))
       (insert (format "\n#endif /* %s */\n" guard-name)))
 
