@@ -20,6 +20,76 @@
 
 ;;; Configuration
 
+(defconst compc--fallback-runtime-helpers
+  '(wrong_type_argument
+    helper_PSEUDOVECTOR_TYPEP_XUNTAG
+    pure_write_error
+    push_handler
+    record_unwind_protect_excursion
+    helper_unbind_n
+    helper_save_restriction
+    helper_GET_SYMBOL_WITH_POSITION
+    helper_sanitizer_assert
+    record_unwind_current_buffer
+    set_internal
+    helper_unwind_protect
+    specbind
+    maybe_gc
+    maybe_quit)
+  "Fallback list of helper symbols when `comp-runtime-helper-names' is unavailable.")
+
+(defconst compc--helper-prototypes
+  '((wrong_type_argument . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
+    (helper_PSEUDOVECTOR_TYPEP_XUNTAG . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
+    (pure_write_error . ("Lisp_Object" "(Lisp_Object)"))
+    (push_handler . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
+    (record_unwind_protect_excursion . ("Lisp_Object" "(void)"))
+    (helper_unbind_n . ("Lisp_Object" "(Lisp_Object)"))
+    (helper_save_restriction . ("Lisp_Object" "(void)"))
+    (helper_GET_SYMBOL_WITH_POSITION . ("Lisp_Object" "(Lisp_Object)"))
+    (helper_sanitizer_assert . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
+    (record_unwind_current_buffer . ("Lisp_Object" "(void)"))
+    (set_internal . ("Lisp_Object" "(Lisp_Object, Lisp_Object, Lisp_Object, Lisp_Object)"))
+    (helper_unwind_protect . ("Lisp_Object" "(Lisp_Object)"))
+    (specbind . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
+    (maybe_gc . ("Lisp_Object" "(void)"))
+    (maybe_quit . ("Lisp_Object" "(void)")))
+  "Alist describing helper prototypes keyed by helper symbol.")
+
+(defvar compc--runtime-helper-symbols-cache nil
+  "Cached list of helper symbols in runtime order.")
+
+(defvar compc--runtime-helper-name-cache nil
+  "Cached list of helper names as strings.")
+
+(defun compc--runtime-helper-symbols ()
+  "Return helper symbols as provided by the runtime."
+  (or compc--runtime-helper-symbols-cache
+      (setq compc--runtime-helper-symbols-cache
+            (condition-case nil
+                (comp-runtime-helper-names)
+              (error compc--fallback-runtime-helpers)))))
+
+(defun compc--runtime-helper-names ()
+  "Return helper names as strings."
+  (or compc--runtime-helper-name-cache
+      (setq compc--runtime-helper-name-cache
+            (mapcar #'symbol-name (compc--runtime-helper-symbols)))))
+
+(defun compc--helper-name-p (func-name)
+  "Return non-nil if FUNC-NAME (a string) names a runtime helper."
+  (member func-name (compc--runtime-helper-names)))
+
+(defun compc--helper-prototype-line (helper-symbol)
+  "Return struct field declaration string for HELPER-SYMBOL."
+  (let ((spec (alist-get helper-symbol compc--helper-prototypes)))
+    (unless spec
+      (error "Missing helper prototype for %s" helper-symbol))
+    (pcase-let ((`(,ret ,args) spec))
+      (let ((c-name (symbol-name helper-symbol)))
+        (format "%s (*%s) %s;  /* %s */"
+                ret c-name args c-name)))))
+
 (defvar compc-func-is-fixed-arity nil
   "Whether current function being generated has fixed arity.
 Bound dynamically during function generation.")
@@ -117,7 +187,9 @@ Returns cons (min . max) or nil if not found."
 (defun compc-freloc-call (func-name args &optional dst)
   "Generate freloc function call for FUNC-NAME with ARGS.
 If DST is non-nil, assigns result to DST."
-  (let* ((arity (compc-get-subr-arity func-name))
+  (if (compc--helper-name-p func-name)
+      (compc--format-helper-call func-name args dst)
+    (let* ((arity (compc-get-subr-arity func-name))
          (num-args (length args))
          (readable-name (replace-regexp-in-string
                          "[^a-zA-Z0-9_-]"
@@ -168,11 +240,22 @@ If DST is non-nil, assigns result to DST."
                   (format "fn->%s (%d, LIST (%s))"
                           c-name num-args args-str))))))))
 
+      (if dst
+          (if (string-match-p "\n" call-str)
+              (format "%s =\n  %s;" dst call-str)
+            (format "%s = %s;" dst call-str))
+        (format "%s;" call-str)))))
+
+(defun compc--format-helper-call (func-name args dst)
+  "Emit a helper call to FUNC-NAME with ARGS, optionally assigning to DST."
+  (let* ((field (format "fn->%s"
+                        (replace-regexp-in-string "-" "_" func-name)))
+         (call (if args
+                   (format "%s (%s)" field (mapconcat #'identity args ", "))
+                 (format "%s ()" field))))
     (if dst
-        (if (string-match-p "\n" call-str)
-            (format "%s =\n  %s;" dst call-str)
-          (format "%s = %s;" dst call-str))
-      (format "%s;" call-str))))
+        (format "%s = %s;" dst call)
+      (format "%s;" call))))
 
 (defun compc-insn-to-c (insn)
   "Convert LIMPLE INSN to C code."
@@ -641,22 +724,8 @@ Uses c-mode for proper GNU C coding style indentation."
     (insert "\n")
     (compc-insert-line "struct freloc_link_table")
     (compc-with-block
-     (compc-insert-line "Lisp_Object (*wrong_type_argument) (Lisp_Object, Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*helper_PSEUDOVECTOR_TYPEP_XUNTAG) (Lisp_Object, Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*pure_write_error) (Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*push_handler) (Lisp_Object, Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*record_unwind_protect_excursion) (void);")
-     (compc-insert-line "Lisp_Object (*helper_unbind_n) (Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*helper_save_restriction) (void);")
-     (compc-insert-line "Lisp_Object (*helper_GET_SYMBOL_WITH_POSITION) (Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*helper_sanitizer_assert) (Lisp_Object, Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*record_unwind_current_buffer) (void);")
-     (compc-insert-line "Lisp_Object (*set_internal) (Lisp_Object, Lisp_Object, Lisp_Object, Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*helper_unwind_protect) (Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*specbind) (Lisp_Object, Lisp_Object);")
-     (compc-insert-line "Lisp_Object (*maybe_gc) (void);")
-     (compc-insert-line "Lisp_Object (*maybe_quit) (void);")
-
+     (dolist (helper (compc--runtime-helper-symbols))
+       (compc-insert-line (compc--helper-prototype-line helper)))
      (dolist (subr comp-subr-list)
       (let* ((name (subr-name subr))
              (arity (subr-arity subr))
