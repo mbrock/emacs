@@ -772,8 +772,8 @@ Uses c-mode for proper GNU C coding style indentation."
     (buffer-string)))
 
 
-(defun compc-insert-runtime-definitions ()
-  "Insert minimal runtime definitions needed for compiled code."
+(defun compc-insert-base-definitions ()
+  "Insert minimal type and macro definitions for compiled code."
   (insert "#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -890,7 +890,7 @@ Returns the filename of the freloc header (e.g., \"generated/freloc-2b8d5670.h\"
       (insert (format "#ifndef %s\n" guard-name))
       (insert (format "#define %s\n\n" guard-name))
       (insert (format "/* Generated for Emacs ABI hash: %s */\n\n" abi-hash))
-      (compc-insert-runtime-definitions)
+      (compc-insert-base-definitions)
       (insert (compc-generate-freloc-struct))
       (insert (format "\n#endif /* %s */\n" guard-name)))
 
