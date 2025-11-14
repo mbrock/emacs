@@ -132,7 +132,9 @@ Returns plist with only fields needed for C generation."
 
          (push (list :c-name c-name
                     :name (comp-func-name func)
-                    :args (comp-func-l-args func)
+                    :args (if (comp-func-l-p func)
+                              (comp-func-l-args func)
+                            (comp-func-d-lambda-list func))
                     :frame-size (comp-func-frame-size func)
                     :speed (comp-func-speed func)
                     :pure (comp-func-pure func)

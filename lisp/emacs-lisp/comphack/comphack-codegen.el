@@ -512,16 +512,31 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
       (replace-match "\\\\n" nil nil))
     (buffer-string)))
 
+(defun compc--make-data-readable (obj)
+  "Make OBJ readable by converting symbols-with-pos to plain symbols."
+  (cond
+   ((symbol-with-pos-p obj)
+    (bare-symbol obj))
+   ((symbolp obj)
+    obj)
+   ((vectorp obj)
+    (vconcat (mapcar #'compc--make-data-readable obj)))
+   ((consp obj)
+    (cons (compc--make-data-readable (car obj))
+          (compc--make-data-readable (cdr obj))))
+   (t obj)))
+
 (defun compc-insert-blob (name obj)
   "Insert static blob declaration for NAME containing OBJ.
 Uses C raw string literals (GCC extension with -std=gnu99) with
 unique delimiter to avoid conflicts."
-  (let ((serialized (let ((print-length nil)
-                          (print-level nil)
-                          (print-circle t)
-                          (print-escape-newlines t)
-                          (print-escape-multibyte t))
-                      (prin1-to-string obj))))
+  (let* ((readable-obj (compc--make-data-readable obj))
+         (serialized (let ((print-length nil)
+                           (print-level nil)
+                           (print-circle t)
+                           (print-escape-newlines t)
+                           (print-escape-multibyte t))
+                       (prin1-to-string readable-obj))))
     (insert "\n")
     (compc-insert-line (format "DEFBLOB (%s,\n  R\"LISP(%s)LISP\");" name serialized))))
 
