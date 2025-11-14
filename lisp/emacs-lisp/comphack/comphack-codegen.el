@@ -48,6 +48,14 @@ Bound dynamically during code generation.")
   "Hash table mapping constants to d_reloc indices.
 Bound dynamically during code generation.")
 
+(defvar compc--d-impure-idx nil
+  "Hash table mapping constants to d_reloc_imp indices.
+Bound dynamically during code generation.")
+
+(defvar compc--d-ephemeral-idx nil
+  "Hash table mapping constants to d_reloc_eph indices.
+Bound dynamically during code generation.")
+
 (defun compc-immediate-to-c (val)
   "Convert immediate VAL (literal/closure template) to C code.
 Uses d_reloc when the value lives in the default data vector."
@@ -65,9 +73,17 @@ Uses d_reloc when the value lives in the default data vector."
        (format "%s ()" c-name)))
     (_
      (let ((idx (and compc--d-default-idx (gethash val compc--d-default-idx))))
-       (if idx
-           (format "RELOC (%d)" idx)
-         (error "Immediate not found in d-default-idx: %S" val))))))
+       (cond
+        (idx
+         (format "RELOC (%d)" idx))
+        ((and compc--d-impure-idx
+              (setq idx (gethash val compc--d-impure-idx)))
+         (format "RELOC_IMP (%d)" idx))
+        ((and compc--d-ephemeral-idx
+              (setq idx (gethash val compc--d-ephemeral-idx)))
+         (format "RELOC_EPH (%d)" idx))
+        (t
+         (error "Immediate not found in any reloc idx: %S" val)))))))
 
 (defun compc-mvar-to-c (mvar)
   "Convert MVAR to C variable reference or constant."
@@ -529,10 +545,15 @@ unique delimiter to avoid conflicts."
   "Insert complete .eln C source from MINIMAL context into current buffer.
 FRELOC-FILENAME specifies the ABI-versioned freloc header to include.
 Uses c-mode for proper GNU C coding style indentation."
-  (pcase-let* (((map :functions :d-default-idx) minimal)
+  (pcase-let* (((map :functions
+                     :d-default-idx
+                     :d-impure-idx
+                     :d-ephemeral-idx) minimal)
                (freloc-h (or freloc-filename "freloc.h")))
 
     (let ((compc--d-default-idx d-default-idx)
+          (compc--d-impure-idx d-impure-idx)
+          (compc--d-ephemeral-idx d-ephemeral-idx)
           (buffer-undo-list t)
           (inhibit-modification-hooks t))
      ; (c-mode)

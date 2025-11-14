@@ -95,35 +95,12 @@ Uses Emacs's native-compile in dry-run mode to capture the IR."
    (t insn)))
 
 (defun comphack--extract-data-container (container)
-  "Extract data from CONTAINER as vector.
+  "Extract serialized data from CONTAINER.
 Returns cons of (vector . index-hash) mapping objects to indices.
-Uses comp-data-container-l which is populated by comp--finalize-relocs."
-  (let* ((objects-list (comp-data-container-l container))
-         (idx-map (make-hash-table :test 'equal))
-         (objects nil)
-         (seen (make-hash-table :test 'equal)))
-
-    ;; Filter, normalize, and deduplicate objects from the list
-    (dolist (obj objects-list)
-      (unless (comp-cstr-p obj)
-        ;; Convert symbol-with-pos to plain symbol for comparison
-        (let ((normalized (if (symbol-with-pos-p obj)
-                             (bare-symbol obj)
-                           obj)))
-          ;; Only add if we haven't seen this object before
-          (unless (gethash normalized seen)
-            (puthash normalized t seen)
-            (push normalized objects)))))
-
-    (setq objects (nreverse objects))
-
-    ;; Build index map
-    (let ((idx 0))
-      (dolist (obj objects)
-        (puthash obj idx idx-map)
-        (setq idx (1+ idx))))
-
-    (cons (vconcat objects) idx-map)))
+Preserves both the ordering and indexing computed by `comp--finalize-relocs'."
+  (let* ((objects (vconcat (comp-data-container-l container)))
+         (idx-map (copy-hash-table (comp-data-container-idx container))))
+    (cons objects idx-map)))
 
 (defun comphack--simplify-ctxt (ctxt)
   "Extract minimal compilation context from COMP-CTXT.
