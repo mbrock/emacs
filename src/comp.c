@@ -716,24 +716,44 @@ helper_GET_SYMBOL_WITH_POSITION (Lisp_Object);
 static Lisp_Object
 helper_sanitizer_assert (Lisp_Object, Lisp_Object);
 
+#define COMP_RUNTIME_HELPERS(_)        \
+   _ (wrong_type_argument)              \
+   _ (helper_PSEUDOVECTOR_TYPEP_XUNTAG) \
+   _ (pure_write_error)                 \
+   _ (push_handler)                     \
+   _ (record_unwind_protect_excursion)  \
+   _ (helper_unbind_n)                  \
+   _ (helper_save_restriction)          \
+   _ (helper_GET_SYMBOL_WITH_POSITION)  \
+   _ (helper_sanitizer_assert)          \
+   _ (record_unwind_current_buffer)     \
+   _ (set_internal)                     \
+   _ (helper_unwind_protect)            \
+   _ (specbind)                         \
+   _ (maybe_gc)                         \
+   _ (maybe_quit)
+
 /* Note: helper_link_table must match the list created by
    `declare_runtime_imported_funcs'.  */
-static void *helper_link_table[] =
-  { wrong_type_argument,
-    helper_PSEUDOVECTOR_TYPEP_XUNTAG,
-    pure_write_error,
-    push_handler,
-    record_unwind_protect_excursion,
-    helper_unbind_n,
-    helper_save_restriction,
-    helper_GET_SYMBOL_WITH_POSITION,
-    helper_sanitizer_assert,
-    record_unwind_current_buffer,
-    set_internal,
-    helper_unwind_protect,
-    specbind,
-    maybe_gc,
-    maybe_quit };
+static void *helper_link_table[] = {
+#define COMP_RUNTIME_HELPER_PTR(name) name,
+  COMP_RUNTIME_HELPERS (COMP_RUNTIME_HELPER_PTR)
+#undef COMP_RUNTIME_HELPER_PTR
+};
+
+DEFUN ("comp-runtime-helper-names", Fcomp_runtime_helper_names,
+       Scomp_runtime_helper_names, 0, 0, 0,
+       doc: /* Return list of runtime helper symbols used in freloc tables.
+The order matches the helper section that precedes subrs in each table.  */)
+(void)
+{
+  Lisp_Object acc = Qnil;
+#define COMP_RUNTIME_HELPER_CONS(name) \
+   acc = Fcons (intern_c_string (#name), acc);
+  COMP_RUNTIME_HELPERS (COMP_RUNTIME_HELPER_CONS)
+#undef COMP_RUNTIME_HELPER_CONS
+  return Fnreverse (acc);
+}
 
 
 static char * ATTRIBUTE_FORMAT_PRINTF (1, 2)
@@ -5839,6 +5859,7 @@ natively-compiled one.  */);
   defsubr (&Scomp__register_lambda);
   defsubr (&Scomp__register_subr);
   defsubr (&Scomp__late_register_subr);
+  defsubr (&Scomp_runtime_helper_names);
   defsubr (&Snative_elisp_load);
 
   staticpro (&comp.exported_funcs_h);
