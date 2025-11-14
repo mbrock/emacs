@@ -772,6 +772,102 @@ Uses c-mode for proper GNU C coding style indentation."
     (buffer-string)))
 
 
+(defun compc-insert-runtime-definitions ()
+  "Insert minimal runtime definitions needed for compiled code."
+  (insert "#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* Basic Lisp_Object type */
+typedef intptr_t Lisp_Object;
+
+/* Constants */
+#define Qnil ((Lisp_Object)0)
+#define Qt ((Lisp_Object)1)
+#define Qmany ((Lisp_Object)2)
+#define CONST Qnil
+
+/* Thread state */
+struct thread_state {
+    void *dummy;
+};
+
+/* Static object type */
+typedef struct {
+    ptrdiff_t len;
+    char data[];
+} static_obj_t;
+
+/* Fixnum operations */
+#define FIXNUM_BITS (sizeof(Lisp_Object) * 8 - 3)
+
+static inline Lisp_Object make_fixnum(intptr_t n) {
+    return (n << 2) | 2;
+}
+
+static inline intptr_t XFIXNUM(Lisp_Object a) {
+    return a >> 2;
+}
+
+/* Stubs */
+static inline Lisp_Object build_string(const char *str) {
+    (void)str;
+    return Qnil;
+}
+
+static inline Lisp_Object intern_c_string(const char *str) {
+    (void)str;
+    return Qnil;
+}
+
+static inline Lisp_Object comp_maybe_gc_or_quit(ptrdiff_t n, Lisp_Object *args) {
+    (void)n; (void)args;
+    return Qnil;
+}
+
+static inline Lisp_Object Fcons(Lisp_Object car, Lisp_Object cdr) {
+    (void)car; (void)cdr;
+    return Qnil;
+}
+
+/* Comp unit structure */
+struct Lisp_Native_Comp_Unit {
+    Lisp_Object header;
+};
+
+/* Defines */
+#define config_h 1
+#define lisp_h 1
+#define comp_h 1
+
+/* Macros */
+#define CALL(f, ...) (fn->f (__VA_ARGS__))
+#define RELOC(i) d_reloc[i]
+#define RELOC_IMP(i) d_reloc_imp[i]
+#define RELOC_EPH(i) d_reloc_eph[i]
+#define LIST(...) (Lisp_Object[]){__VA_ARGS__}
+
+#define DEFBLOB(name, str) \\
+  struct { ptrdiff_t len; char data[sizeof(str)]; } name ## _blob = \\
+    { .len = sizeof(str), .data = str }; \\
+  static static_obj_t *name = (static_obj_t *)&name ## _blob
+
+#define REGISTER_SUBR(name_idx, cname_idx, min, max, rest_idx) \\
+  fn->f_comp__register_subr(RELOC_EPH(name_idx), RELOC_EPH(cname_idx), \\
+                            make_fixnum(min), make_fixnum(max), \\
+                            Qnil, RELOC_EPH(rest_idx), comp_u)
+
+#define ARGS_0    (void)
+#define ARGS_1    (Lisp_Object arg0)
+#define ARGS_2    (Lisp_Object arg0, Lisp_Object arg1)
+#define ARGS_3    (Lisp_Object arg0, Lisp_Object arg1, Lisp_Object arg2)
+#define ARGS_MANY (ptrdiff_t nargs, Lisp_Object *args)
+
+#define DEFUN(lisp_name, c_name, args) \\
+  Lisp_Object c_name args
+
+"))
+
 ;;;###autoload
 (defun comphack-codegen-ensure-freloc-h ()
   "Ensure ABI-versioned freloc.h exists, generating if necessary.
@@ -794,23 +890,7 @@ Returns the filename of the freloc header (e.g., \"generated/freloc-2b8d5670.h\"
       (insert (format "#ifndef %s\n" guard-name))
       (insert (format "#define %s\n\n" guard-name))
       (insert (format "/* Generated for Emacs ABI hash: %s */\n\n" abi-hash))
-      ;; Inline comphack.h contents to avoid path issues
-      (let* ((comphack-h (expand-file-name "comphack.h" base-dir))
-             (content (with-temp-buffer
-                        (insert-file-contents comphack-h)
-                        ;; Strip header guards
-                        (goto-char (point-min))
-                        (when (re-search-forward "^#ifndef COMPHACK_H" nil t)
-                          (delete-region (line-beginning-position) (1+ (line-end-position))))
-                        (when (re-search-forward "^#define COMPHACK_H" nil t)
-                          (delete-region (line-beginning-position) (1+ (line-end-position))))
-                        (goto-char (point-max))
-                        (when (re-search-backward "^#endif /\\* COMPHACK_H \\*/" nil t)
-                          (delete-region (line-beginning-position) (1+ (line-end-position))))
-                        (buffer-string))))
-        (insert "/* Begin inlined comphack.h */\n")
-        (insert content)
-        (insert "/* End inlined comphack.h */\n\n"))
+      (compc-insert-runtime-definitions)
       (insert (compc-generate-freloc-struct))
       (insert (format "\n#endif /* %s */\n" guard-name)))
 
