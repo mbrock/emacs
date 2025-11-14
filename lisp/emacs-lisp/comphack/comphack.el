@@ -125,11 +125,11 @@ Uses comp-data-container-l which is populated by comp--finalize-relocs."
 
     (cons (vconcat objects) idx-map)))
 
-(defun comphack--simplify-ctxt (comp-ctxt)
+(defun comphack--simplify-ctxt (ctxt)
   "Extract minimal compilation context from COMP-CTXT.
 Returns plist with only fields needed for C generation."
   ;; Finalize relocations to populate data container lists
-  (let ((comp-ctxt comp-ctxt))
+  (let ((comp-ctxt ctxt))
     (comp--finalize-relocs))
 
   (let ((funcs-list nil))
@@ -161,15 +161,15 @@ Returns plist with only fields needed for C generation."
                     :pure (comp-func-pure func)
                     :blocks (nreverse blocks-list))
                funcs-list)))
-     (comp-ctxt-funcs-h comp-ctxt))
+     (comp-ctxt-funcs-h ctxt))
 
     ;; Extract data containers
     (let ((d-default (comphack--extract-data-container
-                     (comp-ctxt-d-default comp-ctxt)))
+                     (comp-ctxt-d-default ctxt)))
           (d-impure (comphack--extract-data-container
-                    (comp-ctxt-d-impure comp-ctxt)))
+                    (comp-ctxt-d-impure ctxt)))
           (d-ephemeral (comphack--extract-data-container
-                       (comp-ctxt-d-ephemeral comp-ctxt))))
+                       (comp-ctxt-d-ephemeral ctxt))))
 
       (list :functions (nreverse funcs-list)
             :d-default (car d-default)
@@ -178,10 +178,10 @@ Returns plist with only fields needed for C generation."
             :d-impure-idx (cdr d-impure)
             :d-ephemeral (car d-ephemeral)
             :d-ephemeral-idx (cdr d-ephemeral)
-            :function-docs (comp-ctxt-function-docs comp-ctxt)
-            :speed (comp-ctxt-speed comp-ctxt)
-            :debug (comp-ctxt-debug comp-ctxt)
-            :compiler-options (comp-ctxt-compiler-options comp-ctxt)))))
+            :function-docs (comp-ctxt-function-docs ctxt)
+            :speed (comp-ctxt-speed ctxt)
+            :debug (comp-ctxt-debug ctxt)
+            :compiler-options (comp-ctxt-compiler-options ctxt)))))
 
 ;;; Public API
 
@@ -236,12 +236,12 @@ Returns OUTPUT-FILE on success."
 
     output-file))
 
-(defun comphack-compile-comp-ctxt (comp-ctxt output-file &optional keep-c-source)
+(defun comphack-compile-comp-ctxt (ctxt output-file &optional keep-c-source)
   "Compile COMP-CTXT (a `comp-ctxt' struct) to OUTPUT-FILE using comphack.
 When KEEP-C-SOURCE is non-nil, preserve the intermediate C translation."
   (unless output-file
     (error "Output file must be specified for comphack compilation"))
-  (let* ((minimal (comphack--simplify-ctxt comp-ctxt))
+  (let* ((minimal (comphack--simplify-ctxt ctxt))
          (freloc-filename (comphack-codegen-ensure-freloc-h))
          (tmp-c-file (make-temp-file "emacs-comphack-" nil ".c")))
     (unwind-protect
@@ -263,10 +263,8 @@ Signals error if compilation fails."
          (all-flags (append comphack-compiler-flags
                             native-comp-comphack-extra-flags
                             include-flags
-                            (list "-o" eln-file c-file)))
-         (command (mapconcat #'shell-quote-argument
-                             (cons native-comp-comphack-cc all-flags)
-                             " ")))
+                            (list "-o" eln-file c-file))))
+    (make-directory (file-name-directory eln-file) t)
 
     (message "Compiling C → ELN: %s" (file-name-nondirectory eln-file))
 
@@ -280,22 +278,6 @@ Signals error if compilation fails."
                  exit-code
                  (buffer-string)))))))
 
-(defun comphack-compile-comp-ctxt (comp-ctxt output-file &optional keep-c-source)
-  "Compile COMP-CTXT to OUTPUT-FILE using the comphack pipeline.
-When KEEP-C-SOURCE is non-nil, do not delete the temporary C translation."
-  (unless output-file
-    (error "Output file must be specified for comphack compilation"))
-  (let* ((minimal (comphack--simplify-ctxt comp-ctxt))
-         (freloc-filename (comphack-codegen-ensure-freloc-h))
-         (tmp-c-file (make-temp-file "emacs-comphack-" nil ".c")))
-    (unwind-protect
-        (progn
-          (with-temp-file tmp-c-file
-            (comphack-codegen-insert-complete-eln minimal freloc-filename))
-          (comphack--compile-c-to-eln tmp-c-file output-file)
-          output-file)
-      (unless keep-c-source
-        (ignore-errors (delete-file tmp-c-file))))))
 
 ;;; Debugging Utilities
 

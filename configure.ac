@@ -1758,6 +1758,7 @@ AC_ARG_WITH([native-compilation-backend],
      comphack) native_comp_backend=comphack ;;
      *) AC_MSG_ERROR([bad value $withval for native-compilation-backend option]) ;;
    esac])
+AC_SUBST([NATIVE_COMP_BACKEND], [$native_comp_backend])
 
 comphack_cc=${CC}
 AC_ARG_WITH([comphack-cc],
@@ -1772,35 +1773,6 @@ comphack_cc_flags=
 AC_ARG_WITH([comphack-cc-flags],
   [AS_HELP_STRING([--with-comphack-cc-flags=FLAGS],
                   [additional compiler flags for comphack builds.])],
-  [if test "x$withval" != x; then
-     comphack_cc_flags=$withval
-   fi])
-AC_SUBST([COMPHACK_CC_FLAGS], [$comphack_cc_flags])
-
-native_comp_backend=auto
-AC_ARG_WITH([native-compilation-backend],
-  [AS_HELP_STRING([--with-native-compilation-backend@<:@=BACKEND@:>@],
-                  [select the native compilation backend: 'auto' (default),
-		   'gccjit', or 'comphack'.])],
-  [case $withval in
-     auto|gccjit|comphack) native_comp_backend=$withval ;;
-     *)      AC_MSG_ERROR([bad value $withval for native-compilation-backend option]) ;;
-   esac])
-AC_SUBST([NATIVE_COMP_BACKEND], [$native_comp_backend])
-
-comphack_cc=${CC}
-AC_ARG_WITH([comphack-cc],
-  [AS_HELP_STRING([--with-comphack-cc=PROGRAM],
-                  [compiler to use for the comphack backend.])],
-  [if test "x$withval" != x; then
-     comphack_cc=$withval
-   fi])
-AC_SUBST([COMPHACK_CC], [$comphack_cc])
-
-comphack_cc_flags=
-AC_ARG_WITH([comphack-cc-flags],
-  [AS_HELP_STRING([--with-comphack-cc-flags=FLAGS],
-                  [extra compiler flags for the comphack backend.])],
   [if test "x$withval" != x; then
      comphack_cc_flags=$withval
    fi])

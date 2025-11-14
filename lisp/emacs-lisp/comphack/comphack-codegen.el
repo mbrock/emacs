@@ -15,6 +15,9 @@
 (require 'cc-mode)
 (require 'map)
 
+(declare-function comp-mvar-const "comp")
+(declare-function comphack-get-abi-hash "comphack")
+
 ;;; Configuration
 
 (defvar compc-func-is-fixed-arity nil
@@ -661,9 +664,8 @@ Uses c-mode for proper GNU C coding style indentation."
                                  (_ "_")))
                              name))
              (readable-name (replace-regexp-in-string "-" "_" readable-name))
-             (c-name (concat "f_" readable-name))
-             (min-arity (car arity))
-             (max-arity (cdr arity)))
+            (c-name (concat "f_" readable-name))
+            (max-arity (cdr arity)))
 
         (cond
          ((or (eq max-arity 'many) (eq max-arity 'unevalled))
