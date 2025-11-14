@@ -583,6 +583,7 @@ unique delimiter to avoid conflicts."
 (defun compc-insert-top-level-run (minimal)
   "Insert top_level_run entry point from MINIMAL context."
   (let ((functions (plist-get minimal :functions))
+        (d-default-idx (plist-get minimal :d-default-idx))
         (d-ephemeral-idx (plist-get minimal :d-ephemeral-idx)))
 
     (compc-insert-line "/* Entry point */")
@@ -631,11 +632,24 @@ unique delimiter to avoid conflicts."
               (error "Failed to find indices for function %s: name-idx=%S c-name-idx=%S rest-idx=%S"
                      name name-idx c-name-idx rest-idx))
 
-            (compc-insert-line
-             (format "REGISTER_SUBR (%d, %d, %d, %d, %d);  /* %s */"
-                     name-idx c-name-idx
-                     (or min-args 0) (or effective-max-args -1)
-                     rest-idx name))
+            ;; For dynamic functions (lambda-list), need to pass indices to arity cons and lambda-list
+            ;; For lexical functions, pass numeric min/max
+            (let ((minarg-code (format "make_fixnum (%d)" (or min-args 0)))
+                  (maxarg-code (format "make_fixnum (%d)" (or effective-max-args -1))))
+              (when (listp args)  ;; Dynamic function with lambda-list
+                ;; Look up arity cons (min . max) in ephemeral
+                (let ((arity-cons (cons min-args max-args)))
+                  (when-let ((arity-idx (gethash arity-cons d-ephemeral-idx)))
+                    (setq minarg-code (format "RELOC_EPH (%d)" arity-idx))))
+                ;; Look up lambda-list in default
+                (when-let ((lambda-list-idx (gethash args d-default-idx)))
+                  (setq maxarg-code (format "RELOC (%d)" lambda-list-idx))))
+
+              (compc-insert-line
+               (format "fn->f_comp__register_subr(RELOC_EPH (%d), RELOC_EPH (%d), %s, %s, Qnil, RELOC_EPH (%d), comp_u);  /* %s */"
+                       name-idx c-name-idx
+                       minarg-code maxarg-code
+                       rest-idx name)))
             (cl-incf func-idx)))))
 
      (insert "\n")
