@@ -596,42 +596,47 @@ unique delimiter to avoid conflicts."
                           (equal (plist-get f :c-name) "top_level_run"))
                         functions)))
 
-       (dolist (func user-funcs)
-         (let* ((name-raw (plist-get func :name))
-                (c-name (plist-get func :c-name))
-                (args (plist-get func :args))
-                (name (if (symbol-with-pos-p name-raw)
-                          (bare-symbol name-raw)
-                        name-raw))
-                (args-clean (cond
-                             ((comp-args-p args)
-                              (list (comp-args-min args) (comp-args-max args)))
-                             ((comp-nargs-p args)
-                              (list (comp-nargs-min args) (comp-nargs-nonrest args)))
-                             ((listp args)
-                              ;; Lambda list - compute arity from length
-                              (let ((len (length args)))
-                                (list len len)))
-                             (t (error "Unknown args type for function %s: %S" name args))))
-                (min-args (car args-clean))
-                (max-args (cadr args-clean))
-                (has-rest-args (compc-func-has-rest-args-p func))
-                ;; If function has rest args, max-args should be MANY (-2)
-                (effective-max-args (if has-rest-args -2 max-args))
-                ;; Try both raw and bare symbol for lookup since hash may use either
-                (name-idx (or (gethash name d-ephemeral-idx)
-                              (gethash name-raw d-ephemeral-idx)))
-                (c-name-idx (gethash c-name d-ephemeral-idx)))
+       (let ((func-idx 0))
+        (dolist (func user-funcs)
+          (let* ((name-raw (plist-get func :name))
+                 (c-name (plist-get func :c-name))
+                 (args (plist-get func :args))
+                 (name (if (symbol-with-pos-p name-raw)
+                           (bare-symbol name-raw)
+                         name-raw))
+                 (args-clean (cond
+                              ((comp-args-p args)
+                               (list (comp-args-min args) (comp-args-max args)))
+                              ((comp-nargs-p args)
+                               (list (comp-nargs-min args) (comp-nargs-nonrest args)))
+                              ((listp args)
+                               ;; Lambda list - compute arity from length
+                               (let ((len (length args)))
+                                 (list len len)))
+                              (t (error "Unknown args type for function %s: %S" name args))))
+                 (min-args (car args-clean))
+                 (max-args (cadr args-clean))
+                 (has-rest-args (compc-func-has-rest-args-p func))
+                 ;; If function has rest args, max-args should be MANY (-2)
+                 (effective-max-args (if has-rest-args -2 max-args))
+                 ;; Try both raw and bare symbol for lookup since hash may use either
+                 (name-idx (or (gethash name d-ephemeral-idx)
+                               (gethash name-raw d-ephemeral-idx)))
+                 (c-name-idx (gethash c-name d-ephemeral-idx))
+                 ;; Rest list is (doc-idx intspec command-modes)
+                 (rest-list (list func-idx nil nil))
+                 (rest-idx (gethash rest-list d-ephemeral-idx)))
 
-           (unless (and name-idx c-name-idx)
-             (error "Failed to find indices for function %s: name-idx=%S c-name-idx=%S"
-                    name name-idx c-name-idx))
+            (unless (and name-idx c-name-idx rest-idx)
+              (error "Failed to find indices for function %s: name-idx=%S c-name-idx=%S rest-idx=%S"
+                     name name-idx c-name-idx rest-idx))
 
-           (compc-insert-line
-            (format "REGISTER_SUBR (%d, %d, %d, %d, %d);  /* %s */"
-                    name-idx c-name-idx
-                    (or min-args 0) (or effective-max-args -1)
-                    (1+ c-name-idx) name)))))
+            (compc-insert-line
+             (format "REGISTER_SUBR (%d, %d, %d, %d, %d);  /* %s */"
+                     name-idx c-name-idx
+                     (or min-args 0) (or effective-max-args -1)
+                     rest-idx name))
+            (cl-incf func-idx)))))
 
      (insert "\n")
      (compc-insert-line "return Qt;"))))
