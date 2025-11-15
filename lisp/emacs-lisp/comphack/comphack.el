@@ -36,7 +36,8 @@
       "unknown"))
 
 (defvar comphack-compiler-flags
-  '("-shared" "-fPIC" "-O2" "-w" "-fno-stack-protector" "-fno-toplevel-reorder")
+  '("-shared" "-fPIC" "-O0" "-g" "-w"
+    "-fno-stack-protector" "-fno-toplevel-reorder")
   "Flags passed to the compiler when compiling C to .eln.
 The -fno-toplevel-reorder flag is critical to preserve blob declaration order.")
 
@@ -69,7 +70,6 @@ Uses Emacs's native-compile in dry-run mode to capture the IR."
         (native-comp-speed 2)
         (native-comp-eln-load-path (list (temporary-file-directory)))
         (comphack--captured-ctxt nil))
-
     (push '(comp--final comphack--capture-hook) comp-post-pass-hooks)
 
     (unwind-protect
@@ -86,37 +86,60 @@ Uses Emacs's native-compile in dry-run mode to capture the IR."
 
 ;;; Minimal Context Extraction
 
+(defconst comphack--type-hint-symbols '(fixnum cons)
+  "Type hints accepted by `comp-mvar-type-hint-match-p'.
+Composite hints such as `integer' and `number' are inferred from these or
+from literal values.")
+
+(defun comphack--collect-type-hints (mvar)
+  "Return list of type symbols proven for MVAR."
+  (when (and (comp-mvar-p mvar)
+             (fboundp 'comp-mvar-type-hint-match-p))
+    (let (hints)
+      (dolist (sym comphack--type-hint-symbols)
+        (when (comp-mvar-type-hint-match-p mvar sym)
+          (cl-pushnew sym hints)))
+      (when (memq 'fixnum hints)
+        (cl-pushnew 'integer hints)
+        (cl-pushnew 'number hints))
+      (when (memq 'integer hints)
+        (cl-pushnew 'number hints))
+      hints)))
+
 (defun comphack--clean-insn (insn)
   "Remove unprintable objects from INSN for serialization.
 Returns either a slot number, a constant value wrapper, or a plist representation."
   (cond
    ((comp-mvar-p insn)
     ;; If mvar has a slot, use the slot number or symbol (e.g., 'scratch')
-    (let ((slot (comp-mvar-slot insn)))
-      (if slot
-          slot
-        ;; No slot - check if it's a constant (comp-cstr-imm is set by make--comp-mvar)
-        (let ((const-val (comp-cstr-imm insn)))
-          (if const-val
-              ;; Wrap constant in mvar plist to distinguish from slot numbers
-              `(mvar :val ,const-val)
-            ;; Fallback: try valset
-            (let ((valset (comp-cstr-valset insn)))
-              (if (and valset (= (length valset) 1))
-                  (let ((val (car valset)))
-                    ;; Only treat as constant if it's a known constant type
-                    (if (or (null val)        ; nil
-                            (eq val t)         ; t
-                            (numberp val)      ; numbers
-                            (stringp val)      ; strings
-                            (vectorp val)      ; vectors
-                            (consp val))       ; conses
-                        ;; Wrap in mvar plist
-                        `(mvar :val ,val)
-                      ;; Symbol but not a known constant - keep as mvar representation
-                      `(mvar :val ,val)))
-                ;; No clear constant value - keep minimal mvar info
-                `(mvar :val nil))))))))
+    (let* ((slot (comp-mvar-slot insn))
+           (const-val (comp-cstr-imm insn))
+           (valset (comp-cstr-valset insn))
+           (type-hints (comphack--collect-type-hints insn))
+           (plist nil))
+      (cond
+       (slot
+        (setq plist (plist-put plist :slot slot)))
+       (const-val
+        (setq plist (plist-put plist :val const-val)))
+       ((and valset (= (length valset) 1))
+        (let ((val (car valset)))
+          ;; Only treat as constant if it's a known constant type
+          (if (or (null val)        ; nil
+                  (eq val t)        ; t
+                  (numberp val)     ; numbers
+                  (stringp val)     ; strings
+                  (vectorp val)     ; vectors
+                  (consp val))      ; conses
+              (setq plist (plist-put plist :val val))
+            ;; Symbol but not a known constant - keep as mvar representation
+            (setq plist (plist-put plist :val val)))))
+       ;; No clear constant value - keep placeholder
+       (t
+        (setq plist (plist-put plist :val nil))))
+      (when type-hints
+        (setq plist (plist-put plist :type-hints type-hints)))
+      `(mvar ,@plist)))
    ((proper-list-p insn)
     (mapcar #'comphack--clean-insn insn))
    (t insn)))

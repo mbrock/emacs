@@ -20,7 +20,7 @@
 (declare-function comphack--strip-positions "comphack")
 
 (defvar compc--args-many-functions nil
-  "Hash table mapping c-name → t for functions using ARGS_MANY calling convention.")
+  "Hash table mapping symbols → t for functions using ARGS_MANY calling convention.")
 
 ;;; Helper Functions
 
@@ -34,8 +34,8 @@
 
 (defconst compc--helper-prototypes
   '((wrong_type_argument . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
-    (helper_PSEUDOVECTOR_TYPEP_XUNTAG . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
-    (pure_write_error . ("Lisp_Object" "(Lisp_Object)"))
+    (helper_PSEUDOVECTOR_TYPEP_XUNTAG . ("bool" "(Lisp_Object, int)"))
+    (pure_write_error . ("void" "(Lisp_Object)"))
     (push_handler . ("void*" "(Lisp_Object, int)"))
     (record_unwind_protect_excursion . ("Lisp_Object" "(void)"))
     (helper_unbind_n . ("Lisp_Object" "(Lisp_Object)"))
@@ -46,8 +46,8 @@
     (set_internal . ("Lisp_Object" "(Lisp_Object, Lisp_Object, Lisp_Object, Lisp_Object)"))
     (helper_unwind_protect . ("Lisp_Object" "(Lisp_Object)"))
     (specbind . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
-    (maybe_gc . ("Lisp_Object" "(void)"))
-    (maybe_quit . ("Lisp_Object" "(void)")))
+    (maybe_gc . ("void" "(void)"))
+    (maybe_quit . ("void" "(void)")))
   "Alist describing helper prototypes keyed by helper symbol.")
 
 (defvar compc--runtime-helper-symbols-cache nil
@@ -68,6 +68,30 @@
       (setq compc--runtime-helper-name-cache
             (mapcar #'symbol-name (compc--runtime-helper-symbols)))))
 
+(defvar compc--header-constants-cache nil
+  "Cached plist of constants returned by `comp--header-constants'.")
+
+(defun compc--header-constants ()
+  "Return plist of constants used to build the freloc header."
+  (or compc--header-constants-cache
+      (setq compc--header-constants-cache
+            (comp--header-constants))))
+
+(defun compc--const (plist key)
+  "Fetch KEY from PLIST, signaling if it is missing."
+  (let ((value (plist-get plist key)))
+    (unless (or (integerp value) (memq key '(:use-lsb-tag)))
+      (unless value
+        (error "Missing header constant %s" key)))
+    value))
+
+(defun compc--const-int (plist key)
+  "Like `compc--const' but ensure the value is an integer."
+  (let ((value (plist-get plist key)))
+    (unless (integerp value)
+      (error "Expected integer for %s, got %S" key value))
+    value))
+
 (defun compc--canonicalize-func-name (func-name)
   "Return FUNC-NAME mapped to the underlying primitive, if needed."
   (or (alist-get func-name compc--pseudo-subr-map nil nil #'string=)
@@ -76,6 +100,15 @@
 (defun compc--helper-name-p (func-name)
   "Return non-nil if FUNC-NAME (a string) names a runtime helper."
   (member func-name (compc--runtime-helper-names)))
+
+(defun compc--name->symbol (name)
+  "Return bare symbol from NAME, handling symbol-with-pos and singleton lists."
+  (cond
+   ((symbol-with-pos-p name) (bare-symbol name))
+   ((symbolp name) name)
+   ((consp name)
+    (compc--name->symbol (car name)))
+   (t nil)))
 
 (defun compc--helper-prototype-line (helper-symbol)
   "Return struct field declaration string for HELPER-SYMBOL."
@@ -183,6 +216,157 @@ Uses d_reloc when the value lives in the default data vector."
         (t (compc-immediate-to-c (comp-mvar-const mv))))))
 
     (_ (compc-immediate-to-c mvar))))
+
+(defun compc--infer-type-hints-from-value (val)
+  "Return list of type symbols implied by literal VAL."
+  (cond
+   ((fixnump val) '(fixnum integer number))
+   ((integerp val) '(integer number))
+   ((floatp val) '(number))
+   ((consp val) '(cons))
+   (t nil)))
+
+(defun compc--mvar-type-hints (mvar)
+  "Return cached type hints stored on MVAR."
+  (cond
+   ((and (listp mvar) (eq (car mvar) 'mvar))
+    (let ((plist (cdr mvar)))
+      (or (plist-get plist :type-hints)
+          (compc--infer-type-hints-from-value (plist-get plist :val)))))
+   ((integerp mvar) nil)
+   ((eq mvar 'scratch) nil)
+   (t nil)))
+
+(defun compc--mvar-has-type (mvar type)
+  "Return non-nil if MVAR is proven to be of TYPE."
+  (memq type (compc--mvar-type-hints mvar)))
+
+(defun compc--mvar-has-any-type (mvar types)
+  "Return non-nil if MVAR is proven to satisfy any type in TYPES."
+  (let ((hints (compc--mvar-type-hints mvar)))
+    (and hints
+         (cl-some (lambda (ty) (memq ty hints))
+                  types))))
+
+(defun compc--maybe-assign (dst expr)
+  "Return C assignment for DST with EXPR, or EXPR when DST is nil."
+  (if dst
+      (format "%s = %s;" dst expr)
+    (format "%s;" expr)))
+
+(defun compc--format-direct-callref (func args dst)
+  "Return C snippet for calling FUNC with ARGS via direct-callref.
+When DST is non-nil, assign the result there; otherwise, just emit
+the call for its side effects."
+  (let* ((func-name (cond
+                     ((stringp func) func)
+                     ((symbolp func) (symbol-name func))
+                     (t (format "%s" func))))
+         (nargs (length args))
+         (call-line (if dst
+                        (format "%s = %s (%d, _args);"
+                                dst func-name nargs)
+                      (format "%s (%d, _args);" func-name nargs))))
+    (if (zerop nargs)
+        (if dst
+            (format "%s = %s (0, NULL);" dst func-name)
+          (format "%s (0, NULL);" func-name))
+      (let* ((args-c (mapcar #'compc-mvar-to-c args))
+             (init-lines (mapcar (lambda (idx-val)
+                                   (pcase-let ((`(,idx . ,val) idx-val))
+                                     (format "  _args[%d] = %s;" idx val)))
+                                 (cl-mapcar #'cons
+                                            (number-sequence 0 (1- nargs))
+                                            args-c))))
+        (format "{\n  Lisp_Object _args[%d];\n%s\n  %s\n}"
+                nargs
+                (mapconcat #'identity init-lines "\n")
+                call-line)))))
+
+(defun compc--emit-optimized-call (func args dst)
+  "Emit inline lowering for FUNC when available.
+ARGS is the raw argument list from the instruction, and DST is the
+stringified destination or nil.  Returns a C snippet string or nil."
+  (let* ((fname (if (symbolp func) (symbol-name func) (format "%s" func)))
+         (args-c (mapcar #'compc-mvar-to-c args))
+         (arg1 (car args))
+         (arg2 (cadr args))
+         (arg1-c (car args-c))
+         (arg2-c (cadr args-c)))
+    (cl-labels ((assign (expr &optional indent)
+                        (let ((line (compc--maybe-assign dst expr)))
+                          (if indent (concat indent line) line)))
+                (sure-fixnum-p (mvar)
+                  (compc--mvar-has-type mvar 'fixnum))
+                (sure-cons-p (mvar)
+                  (compc--mvar-has-type mvar 'cons))
+                (inline-add (arg arg-str delta fallback limit)
+                            (let* ((sign (if (> delta 0) "+" "-"))
+                                   (condition (if (sure-fixnum-p arg)
+                                                  (format "XFIXNUM (_tmp) != %s" limit)
+                                                (format "FIXNUMP (_tmp) && XFIXNUM (_tmp) != %s" limit)))
+                                   (body (format "make_fixnum (XFIXNUM (_tmp) %s %d)" sign 1)))
+                              (format "{\n  Lisp_Object _tmp = %s;\n  if (%s)\n%s\n  else\n%s\n}"
+                                      arg-str condition
+                                      (assign body "    ")
+                                      (assign (format "%s (_tmp)" fallback) "    "))))
+                (inline-negate (arg arg-str)
+                               (let ((condition (if (sure-fixnum-p arg)
+                                                    "XFIXNUM (_tmp) != MOST_NEGATIVE_FIXNUM"
+                                                  "FIXNUMP (_tmp) && XFIXNUM (_tmp) != MOST_NEGATIVE_FIXNUM")))
+                                 (format "{\n  Lisp_Object _tmp = %s;\n  if (%s)\n%s\n  else\n%s\n}"
+                                         arg-str condition
+                                         (assign "make_fixnum (-XFIXNUM (_tmp))" "    ")
+                                         (assign "fn->f__ (1, LIST (_tmp))" "    "))))
+                (inline-cons-access (arg arg-str op fallback)
+                                    (if (sure-cons-p arg)
+                                        (format "{\n  Lisp_Object _tmp = %s;\n%s\n}"
+                                                arg-str
+                                                (assign (format "%s (_tmp)" op) "    "))
+                                      (format "{\n  Lisp_Object _tmp = %s;\n  if (CONSP (_tmp))\n%s\n  else\n%s\n}"
+                                              arg-str
+                                              (assign (format "%s (_tmp)" op) "    ")
+                                              (assign (format "%s (_tmp)" fallback) "    "))))
+                (inline-set (cell cell-str value value-str fallback offset)
+                            (let ((fast-line (when dst (assign "_new" "    "))))
+                              (if (sure-cons-p cell)
+                                  (format "{\n  Lisp_Object _cell = %s;\n  Lisp_Object _new = %s;\n  char *_ptr = compc_xcons_ptr (_cell);\n  CHECK_IMPURE (_cell, _ptr);\n  *(Lisp_Object *)(_ptr + %s) = _new;\n%s}\n"
+                                          cell-str value-str offset
+                                          (or fast-line ""))
+                                (format "{\n  Lisp_Object _cell = %s;\n  Lisp_Object _new = %s;\n  if (CONSP (_cell)) {\n    char *_ptr = compc_xcons_ptr (_cell);\n    CHECK_IMPURE (_cell, _ptr);\n    *(Lisp_Object *)(_ptr + %s) = _new;\n%s  } else {\n%s\n  }\n}"
+                                        cell-str value-str offset
+                                        (or fast-line "")
+                                        (assign (format "%s (_cell, _new)" fallback) "    ")))))
+                (inline-boolean (expr)
+                                 (assign (format "BOOL_TO_LISP (%s)" expr))))
+      (pcase fname
+        ("add1" (inline-add arg1 arg1-c 1 "fn->f_1_PLUS" "MOST_POSITIVE_FIXNUM"))
+        ("sub1" (inline-add arg1 arg1-c -1 "fn->f_1_MINUS" "MOST_NEGATIVE_FIXNUM"))
+        ("negate" (inline-negate arg1 arg1-c))
+        ("consp"
+         (if (sure-cons-p arg1)
+             (assign "Qt")
+           (inline-boolean (format "CONSP (%s)" arg1-c))))
+        ("numberp"
+         (if (compc--mvar-has-any-type arg1 '(number integer fixnum))
+             (assign "Qt")
+           (inline-boolean
+            (format "FIXNUMP (%1$s) || BIGNUMP (%1$s) || FLOATP (%1$s)" arg1-c))))
+        ("integerp"
+         (if (compc--mvar-has-any-type arg1 '(integer fixnum))
+             (assign "Qt")
+           (inline-boolean
+            (format "FIXNUMP (%1$s) || BIGNUMP (%1$s)" arg1-c))))
+        ("car" (inline-cons-access arg1 arg1-c "XCAR" "fn->f_car"))
+        ("cdr" (inline-cons-access arg1 arg1-c "XCDR" "fn->f_cdr"))
+        ("setcar"
+         (inline-set arg1 arg1-c arg2 arg2-c "fn->f_setcar" "CONS_CAR_OFFSET"))
+        ("setcdr"
+         (inline-set arg1 arg1-c arg2 arg2-c "fn->f_setcdr" "CONS_CDR_OFFSET"))
+        ("comp-maybe-gc-or-quit"
+         (format "{\n  compc_maybe_gc_or_quit (fn);\n%s\n}"
+                 (if dst (assign "Qnil" "  ") "")))
+        (_ nil)))))
 
 (defun compc-get-subr-arity (func-name)
   "Get arity of built-in function FUNC-NAME.
@@ -294,23 +478,30 @@ If DST is non-nil, assigns result to DST."
              (compc-immediate-to-c val)))
 
     (`(set ,dst (callref ,func . ,args))
-     (let ((func-name (symbol-name func)))
+     (let* ((dst-c (compc-mvar-to-c dst))
+            (func-name (symbol-name func))
+            (optimized (compc--emit-optimized-call func args dst-c)))
        (cond
+        (optimized optimized)
         ;; Fix ARGS_MANY function registration for callref pattern
         ((equal func-name "comp--register-subr")
-         (let* ((max-arg (nth 3 args))  ; Fourth arg is max-args
-                ;; Extract the max-args value from the mvar
+         (let* ((fun-name-arg (nth 0 args))
+                (fun-name (and (listp fun-name-arg)
+                               (eq (car fun-name-arg) 'mvar)
+                               (plist-get (cdr fun-name-arg) :val)))
+                (max-arg (nth 3 args))
                 (max-val (and (listp max-arg)
-                             (eq (car max-arg) 'mvar)
-                             (plist-get (cdr max-arg) :val)))
-                ;; If max > 3, it's ARGS_MANY (uses (nargs, args) calling convention)
-                (uses-args-many (and (integerp max-val) (> max-val 3)))
-                ;; Replace max arg with Qnil if ARGS_MANY
-                (fixed-args (if uses-args-many
-                               (let ((copy (copy-sequence args)))
-                                 (setf (nth 3 copy) '(mvar :val nil))
-                                 copy)
-                             args))
+                              (eq (car max-arg) 'mvar)
+                              (plist-get (cdr max-arg) :val)))
+                (fun-sym (compc--name->symbol fun-name))
+                (needs-many (or (and fun-sym
+                                     (gethash fun-sym compc--args-many-functions))
+                                (and (integerp max-val) (> max-val 8))))
+                (fixed-args (if needs-many
+                                (let ((copy (copy-sequence args)))
+                                  (setf (nth 3 copy) '(mvar :val nil))
+                                  copy)
+                              args))
                 (args-c (mapcar #'compc-mvar-to-c fixed-args)))
            (compc-freloc-call func-name args-c (compc-mvar-to-c dst))))
 
@@ -318,40 +509,50 @@ If DST is non-nil, assigns result to DST."
          (compc-freloc-call
           func-name
           (mapcar #'compc-mvar-to-c args)
-          (compc-mvar-to-c dst))))))
+          dst-c)))))
 
     (`(set ,dst (call ,func . ,args))
-     (let ((func-name (if (symbolp func) (symbol-name func) (format "%s" func))))
+     (let* ((dst-c (compc-mvar-to-c dst))
+            (func-name (if (symbolp func) (symbol-name func) (format "%s" func)))
+            (optimized (compc--emit-optimized-call func args dst-c)))
        (cond
+        (optimized optimized)
         ((equal func-name "comp-maybe-gc-or-quit")
          (format "%s = comp_maybe_gc_or_quit (%d, %s);"
-                 (compc-mvar-to-c dst)
+                 dst-c
                  (length args)
                  (if (zerop (length args)) "NULL"
                    (format "LIST (%s)" (mapconcat #'compc-mvar-to-c args ", ")))))
 
         ;; Fix ARGS_MANY function registration
         ((equal func-name "comp--register-subr")
-         (let* ((max-arg (nth 3 args))  ; Fourth arg is max-args
-                ;; Extract the max-args value from the mvar
+         (let* ((fun-name-arg (nth 0 args))
+                (fun-name (and (listp fun-name-arg)
+                               (eq (car fun-name-arg) 'mvar)
+                               (plist-get (cdr fun-name-arg) :val)))
+                (max-arg (nth 3 args))
                 (max-val (and (listp max-arg)
-                             (eq (car max-arg) 'mvar)
-                             (plist-get (cdr max-arg) :val)))
-                ;; If max > 3, it's ARGS_MANY (uses (nargs, args) calling convention)
-                (uses-args-many (and (integerp max-val) (> max-val 3)))
-                ;; Replace max arg with Qnil if ARGS_MANY
-                (fixed-args (if uses-args-many
-                               (let ((copy (copy-sequence args)))
-                                 (setf (nth 3 copy) '(mvar :val nil))
-                                 copy)
-                             args))
+                              (eq (car max-arg) 'mvar)
+                              (plist-get (cdr max-arg) :val)))
+                (fun-sym (compc--name->symbol fun-name))
+                (needs-many (or (and fun-sym
+                                     (gethash fun-sym compc--args-many-functions))
+                                (and (integerp max-val) (> max-val 8))))
+                (fixed-args (if needs-many
+                                (let ((copy (copy-sequence args)))
+                                  (setf (nth 3 copy) '(mvar :val nil))
+                                  copy)
+                              args))
                 (args-c (mapcar #'compc-mvar-to-c fixed-args)))
            (compc-freloc-call func-name args-c (compc-mvar-to-c dst))))
 
         (t
          (compc-freloc-call func-name
                             (mapcar #'compc-mvar-to-c args)
-                            (compc-mvar-to-c dst))))))
+                            dst-c)))))
+
+    (`(set ,dst (direct-callref ,c-name . ,args))
+     (compc--format-direct-callref c-name args (compc-mvar-to-c dst)))
 
     (`(set ,dst ,src)
      (format "%s = %s;"
@@ -359,14 +560,16 @@ If DST is non-nil, assigns result to DST."
              (compc-mvar-to-c src)))
 
     (`(callref ,func . ,args)
-     (compc-freloc-call
-      (symbol-name func)
-      (mapcar #'compc-mvar-to-c args)
-      nil))
+     (or (compc--emit-optimized-call func args nil)
+         (compc-freloc-call
+          (symbol-name func)
+          (mapcar #'compc-mvar-to-c args)
+          nil)))
 
     (`(call ,func . ,args)
      (let ((func-name (if (symbolp func) (symbol-name func) (format "%s" func))))
        (cond
+        ((compc--emit-optimized-call func args nil))
         ((equal func-name "comp-maybe-gc-or-quit")
          (format "comp_maybe_gc_or_quit (%d, %s);"
                  (length args)
@@ -375,19 +578,23 @@ If DST is non-nil, assigns result to DST."
 
         ;; Fix ARGS_MANY function registration for standalone calls
         ((equal func-name "comp--register-subr")
-         (let* ((max-arg (nth 3 args))  ; Fourth arg is max-args
-                ;; Extract the max-args value from the mvar
+         (let* ((fun-name-arg (nth 0 args))
+                (fun-name (and (listp fun-name-arg)
+                               (eq (car fun-name-arg) 'mvar)
+                               (plist-get (cdr fun-name-arg) :val)))
+                (max-arg (nth 3 args))
                 (max-val (and (listp max-arg)
-                             (eq (car max-arg) 'mvar)
-                             (plist-get (cdr max-arg) :val)))
-                ;; If max > 3, it's ARGS_MANY (uses (nargs, args) calling convention)
-                (uses-args-many (and (integerp max-val) (> max-val 3)))
-                ;; Replace max arg with Qnil if ARGS_MANY
-                (fixed-args (if uses-args-many
-                               (let ((copy (copy-sequence args)))
-                                 (setf (nth 3 copy) '(mvar :val nil))
-                                 copy)
-                             args))
+                              (eq (car max-arg) 'mvar)
+                              (plist-get (cdr max-arg) :val)))
+                (fun-sym (compc--name->symbol fun-name))
+                (needs-many (or (and fun-sym
+                                     (gethash fun-sym compc--args-many-functions))
+                                (and (integerp max-val) (> max-val 8))))
+                (fixed-args (if needs-many
+                                (let ((copy (copy-sequence args)))
+                                  (setf (nth 3 copy) '(mvar :val nil))
+                                  copy)
+                              args))
                 (args-c (mapcar #'compc-mvar-to-c fixed-args)))
            (compc-freloc-call func-name args-c nil)))
 
@@ -395,6 +602,9 @@ If DST is non-nil, assigns result to DST."
          (compc-freloc-call func-name
                             (mapcar #'compc-mvar-to-c args)
                             nil)))))
+
+    (`(direct-callref ,c-name . ,args)
+     (compc--format-direct-callref c-name args nil))
 
     (`(return ,val)
      (format "return %s;" (compc-mvar-to-c val)))
@@ -513,10 +723,30 @@ If DST is non-nil, assigns result to DST."
     (cl-some
      (lambda (b)
        (cl-some (lambda (insn)
-                 (and (listp insn)
-                      (memq (car insn) '(set-args-to-local set-rest-args-to-local))))
-               (plist-get b :insns)))
+                  (and (listp insn)
+                       (memq (car insn) '(set-args-to-local set-rest-args-to-local))))
+                (plist-get b :insns)))
      blocks)))
+
+(defun compc--function-arity-info (func)
+  "Return plist describing FUNC arity metadata."
+  (pcase-let* (((map :name :args) func)
+               (args-clean (cond
+                            ((comp-args-p args)
+                             (list (aref args 1) (aref args 2)))
+                            ((listp args) args)
+                            (t '(0 0))))
+               (min-args (car args-clean))
+               (max-args (cadr args-clean))
+               (has-rest-args (or (memq max-args '(many unevalled))
+                                  (compc-func-has-rest-args-p func)))
+               (fun-symbol (compc--name->symbol name))
+               (lisp-name (and fun-symbol (symbol-name fun-symbol))))
+    (list :symbol fun-symbol
+          :lisp-name lisp-name
+          :min min-args
+          :max max-args
+          :rest has-rest-args)))
 
 (defun compc-insert-block (block)
   "Insert basic BLOCK using c-mode commands."
@@ -575,19 +805,15 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
 
 (defun compc-insert-func (func)
   "Insert function FUNC using c-mode commands."
-  (pcase-let* (((map :c-name :name :args :frame-size :blocks) func)
-               (args-clean (cond
-                            ((comp-args-p args)
-                             (list (aref args 1) (aref args 2)))
-                            ((listp args) args)
-                            (t '(0 0))))
-               (min-args (car args-clean))
-               (max-args (cadr args-clean))
-               (has-rest-args (compc-func-has-rest-args-p func))
-               (fixed-arity (and (numberp min-args)
-                                (numberp max-args)
-                                (= min-args max-args)
-                                (not has-rest-args)))
+  (pcase-let* (((map :c-name :frame-size :blocks) func)
+               (arity-info (compc--function-arity-info func))
+               (lisp-name (plist-get arity-info :lisp-name))
+               (min-args (plist-get arity-info :min))
+               (max-args (plist-get arity-info :max))
+               (has-rest-args (plist-get arity-info :rest))
+               (fixed-arity (and (numberp max-args)
+                                 (<= max-args 8)
+                                 (not has-rest-args)))
                (params (if fixed-arity
                            (if (zerop max-args)
                                "void"
@@ -598,10 +824,7 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
                          "ptrdiff_t nargs, Lisp_Object *args")))
 
     (let ((compc-func-is-fixed-arity fixed-arity)
-          (func-start (point))
-          (lisp-name (if (symbol-with-pos-p name)
-                        (symbol-name (bare-symbol name))
-                      (symbol-name name))))
+          (func-start (point)))
       ;; Generate DEFUN signature
       (if fixed-arity
           (let ((args-macro (cond
@@ -611,8 +834,6 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
             (if args-macro
                 (compc-insert-line (format "DEFUN (\"%s\", %s, %s)" lisp-name c-name args-macro))
               (compc-insert-line (format "Lisp_Object\n%s (%s)" c-name params))))
-        ;; ARGS_MANY function - record it for fixing registration
-        (puthash c-name t compc--args-many-functions)
         (compc-insert-line (format "DEFUN (\"%s\", %s, ARGS_MANY)" lisp-name c-name)))
 
       (compc-with-block
@@ -762,9 +983,19 @@ Uses c-mode for proper GNU C coding style indentation."
     (let ((compc--d-default-idx d-default-idx)
           (compc--d-impure-idx d-impure-idx)
           (compc--d-ephemeral-idx d-ephemeral-idx)
-          (compc--args-many-functions (make-hash-table :test 'equal))
+          (compc--args-many-functions (make-hash-table :test 'eq))
           (buffer-undo-list t)
           (inhibit-modification-hooks t))
+      (dolist (func functions)
+        (let* ((info (compc--function-arity-info func))
+               (sym (plist-get info :symbol))
+               (max-args (plist-get info :max))
+               (rest (plist-get info :rest))
+               (fixed (and (numberp max-args)
+                           (<= max-args 8)
+                           (not rest))))
+          (when (and sym (not fixed))
+            (puthash sym t compc--args-many-functions))))
      ; (c-mode)
       (font-lock-mode -1)
       (setq c-default-style "gnu")
@@ -794,10 +1025,10 @@ Uses c-mode for proper GNU C coding style indentation."
                                       (t '(0 0))))
                          (min-args (car args-clean))
                          (max-args (cadr args-clean))
-                         (has-rest-args (compc-func-has-rest-args-p func))
-                         (fixed-arity (and (numberp min-args)
-                                           (numberp max-args)
-                                           (= min-args max-args)
+                         (has-rest-args (or (memq max-args '(many unevalled))
+                                            (compc-func-has-rest-args-p func)))
+                         (fixed-arity (and (numberp max-args)
+                                           (<= max-args 8)
                                            (not has-rest-args)))
                          (params (if fixed-arity
                                      (if (zerop max-args)
@@ -835,7 +1066,7 @@ Uses c-mode for proper GNU C coding style indentation."
 (defun compc-generate-freloc-struct ()
   "Generate freloc.h struct definition with all Emacs primitives."
   (with-temp-buffer
-;    (c-mode)
+                                        ;    (c-mode)
     (setq c-default-style "gnu")
 
     (compc-insert-line "/* Function relocation table structure */")
@@ -846,170 +1077,170 @@ Uses c-mode for proper GNU C coding style indentation."
      (dolist (helper (compc--runtime-helper-symbols))
        (compc-insert-line (compc--helper-prototype-line helper)))
      (dolist (subr comp-subr-list)
-      (let* ((name (subr-name subr))
-             (arity (subr-arity subr))
-             (readable-name (replace-regexp-in-string
-                             "[^a-zA-Z0-9_-]"
-                             (lambda (c)
-                               (pcase c
-                                 ("+" "_PLUS")
-                                 ("*" "_STAR")
-                                 ("/" "_SLASH")
-                                 ("<" "_LT")
-                                 (">" "_GT")
-                                 ("=" "_EQ")
-                                 ("?" "_P")
-                                 ("!" "_BANG")
-                                 ("%" "_PCT")
-                                 ("&" "_AND")
-                                 ("|" "_OR")
-                                 ("~" "_TILDE")
-                                 ("^" "_XOR")
-                                 (":" "_COLON")
-                                 ("." "_DOT")
-                                 ("," "_COMMA")
-                                 ("'" "_QUOTE")
-                                 ("\"" "_DQUOTE")
-                                 (_ "_")))
-                             name))
-             (readable-name (replace-regexp-in-string "-" "_" readable-name))
-            (c-name (concat "f_" readable-name))
-            (max-arity (cdr arity)))
+       (let* ((name (subr-name subr))
+              (arity (subr-arity subr))
+              (readable-name (replace-regexp-in-string
+                              "[^a-zA-Z0-9_-]"
+                              (lambda (c)
+                                (pcase c
+                                  ("+" "_PLUS")
+                                  ("*" "_STAR")
+                                  ("/" "_SLASH")
+                                  ("<" "_LT")
+                                  (">" "_GT")
+                                  ("=" "_EQ")
+                                  ("?" "_P")
+                                  ("!" "_BANG")
+                                  ("%" "_PCT")
+                                  ("&" "_AND")
+                                  ("|" "_OR")
+                                  ("~" "_TILDE")
+                                  ("^" "_XOR")
+                                  (":" "_COLON")
+                                  ("." "_DOT")
+                                  ("," "_COMMA")
+                                  ("'" "_QUOTE")
+                                  ("\"" "_DQUOTE")
+                                  (_ "_")))
+                              name))
+              (readable-name (replace-regexp-in-string "-" "_" readable-name))
+              (c-name (concat "f_" readable-name))
+              (max-arity (cdr arity)))
 
-        (cond
-         ((or (eq max-arity 'many) (eq max-arity 'unevalled))
-          (compc-insert-line
-           (format "Lisp_Object (*%s) (ptrdiff_t, Lisp_Object *);  /* %s */" c-name name)))
+         (cond
+          ((or (eq max-arity 'many) (eq max-arity 'unevalled))
+           (compc-insert-line
+            (format "Lisp_Object (*%s) (ptrdiff_t, Lisp_Object *);  /* %s */" c-name name)))
 
-         ;; Fixed arity (including optional args - use max arity)
-         ((numberp max-arity)
-          (let ((params (if (zerop max-arity)
-                            "void"
-                          (mapconcat (lambda (_) "Lisp_Object")
-                                     (number-sequence 1 max-arity)
-                                     ", "))))
-            (compc-insert-line
-             (format "Lisp_Object (*%s) (%s);  /* %s */" c-name params name))))
+          ;; Fixed arity (including optional args - use max arity)
+          ((numberp max-arity)
+           (let ((params (if (zerop max-arity)
+                             "void"
+                           (mapconcat (lambda (_) "Lisp_Object")
+                                      (number-sequence 1 max-arity)
+                                      ", "))))
+             (compc-insert-line
+              (format "Lisp_Object (*%s) (%s);  /* %s */" c-name params name))))
 
-         (t
-          (compc-insert-line
-           (format "Lisp_Object (*%s) (ptrdiff_t, Lisp_Object *);  /* %s */" c-name name)))))))
+          (t
+           (compc-insert-line
+            (format "Lisp_Object (*%s) (ptrdiff_t, Lisp_Object *);  /* %s */" c-name name)))))))
 
 
     (compc-insert-line ";")
     (buffer-string)))
 
 
+
 (defun compc-insert-base-definitions ()
   "Insert minimal type and macro definitions for compiled code."
-  ;; Get handler struct offsets from Emacs runtime
-  (let ((offsets (comp--handler-struct-offsets)))
-    (cl-destructuring-bind (handler-val handler-next handler-jmp thread-handlerlist)
-        offsets
-      (insert "#include <stddef.h>
-#include <stdint.h>
-#include <stdbool.h>
+  (let* ((offsets (comp--handler-struct-offsets))
+         (constants (compc--header-constants))
+         (handler-val (nth 0 offsets))
+         (handler-next (nth 1 offsets))
+         (handler-jmp (nth 2 offsets))
+         (thread-handler (nth 3 offsets))
+         (use-lsb (if (plist-get constants :use-lsb-tag) 1 0))
+         (gctypebits (compc--const-int constants :gctypebits))
+         (valbits (compc--const-int constants :valbits))
+         (inttypebits (compc--const-int constants :inttypebits))
+         (lisp-int0 (compc--const-int constants :lisp-int0))
+         (lisp-int1 (compc--const-int constants :lisp-int1))
+         (lisp-cons (compc--const-int constants :lisp-cons))
+         (lisp-float (compc--const-int constants :lisp-float))
+         (lisp-vectorlike (compc--const-int constants :lisp-vectorlike))
+         (pvec-bignum (compc--const-int constants :pvec-bignum))
+         (mpf (compc--const-int constants :most-positive-fixnum))
+         (mnf (compc--const-int constants :most-negative-fixnum))
+         (pure-size (compc--const-int constants :pure-size))
+         (cons-car (compc--const-int constants :cons-car-offset))
+         (cons-cdr (compc--const-int constants :cons-cdr-offset))
+         (qnil (compc--const-int constants :qnil))
+         (qt (compc--const-int constants :qt))
+         (qmany (compc--const-int constants :qmany)))
+    (insert "#include <stddef.h>\n#include <stdint.h>\n#include <stdbool.h>\n#include <limits.h>\n#include <setjmp.h>\n\n")
+    (insert "struct freloc_link_table;\n\n")
+    (insert "/* Basic Lisp types */\ntypedef intptr_t Lisp_Object;\n")
+    (insert "typedef intptr_t EMACS_INT;\ntypedef uintptr_t EMACS_UINT;\n\n")
+    (insert "/* Constants derived from the running Emacs. */\n")
+    (insert (format "#define USE_LSB_TAG %d\n" use-lsb))
+    (insert (format "#define GCTYPEBITS %d\n" gctypebits))
+    (insert (format "#define VALBITS %d\n" valbits))
+    (insert (format "#define INTTYPEBITS %d\n" inttypebits))
+    (insert (format "#define FIXNUM_BITS (VALBITS + 1)\n"))
+    (insert (format "#define LISP_INT0 %d\n" lisp-int0))
+    (insert (format "#define LISP_INT1 %d\n" lisp-int1))
+    (insert (format "#define LISP_CONS_TAG %d\n" lisp-cons))
+    (insert (format "#define LISP_FLOAT_TAG %d\n" lisp-float))
+    (insert (format "#define LISP_VECTORLIKE_TAG %d\n" lisp-vectorlike))
+    (insert (format "#define PVEC_BIGNUM %d\n" pvec-bignum))
+    (insert (format "#define MOST_POSITIVE_FIXNUM %d\n" mpf))
+    (insert (format "#define MOST_NEGATIVE_FIXNUM %d\n" mnf))
+    (insert (format "#define PURESIZE %d\n" pure-size))
+    (insert (format "#define CONS_CAR_OFFSET %d\n" cons-car))
+    (insert (format "#define CONS_CDR_OFFSET %d\n" cons-cdr))
+    (insert (format "#define Qnil ((Lisp_Object)%d)\n" qnil))
+    (insert (format "#define Qt ((Lisp_Object)%d)\n" qt))
+    (insert (format "#define Qmany ((Lisp_Object)%d)\n" qmany))
+    (insert "#define CONST Qnil\n")
+    (insert "#define TAG_SHIFT (USE_LSB_TAG ? 0 : VALBITS)\n")
+    (insert "#define TAG_MASK (((uintptr_t)1 << GCTYPEBITS) - 1)\n")
+    (insert "#define INTTYPE_MASK (((uintptr_t)1 << INTTYPEBITS) - 1)\n")
+    (insert "#define LISP_WORD_TAG(tag) ((uintptr_t)(tag) << TAG_SHIFT)\n")
+    (insert "#define INTMASK (INTPTR_MAX >> (INTTYPEBITS - 1))\n\n")
+    (insert "/* Thread state relocation (filled by loader) */\nextern void **current_thread_reloc;\n\n")
+    (insert (format "#define HANDLER_VAL_OFFSET %d\n" handler-val))
+    (insert (format "#define HANDLER_NEXT_OFFSET %d\n" handler-next))
+    (insert (format "#define HANDLER_JMP_OFFSET %d\n" handler-jmp))
+    (insert (format "#define THREAD_HANDLERLIST_OFFSET %d\n\n" thread-handler))
+    (insert "#define GET_HANDLER_VAL(h) \\\n    (*(Lisp_Object *)((char *)(h) + HANDLER_VAL_OFFSET))\n")
+    (insert "#define GET_HANDLER_NEXT(h) \\\n    (*(comp_handler_ptr *)((char *)(h) + HANDLER_NEXT_OFFSET))\n")
+    (insert "#define GET_HANDLER_JMP(h) \\\n    ((jmp_buf *)((char *)(h) + HANDLER_JMP_OFFSET))\n")
+    (insert "#define GET_HANDLERLIST() \\\n    (*(comp_handler_ptr *)((char *)(*current_thread_reloc) + THREAD_HANDLERLIST_OFFSET))\n")
+    (insert "#define SET_HANDLERLIST(val) \\\n    (*(comp_handler_ptr *)((char *)(*current_thread_reloc) + THREAD_HANDLERLIST_OFFSET) = (val))\n\n")
+    (insert "/* Opaque handler pointer */\ntypedef void* comp_handler_ptr;\n\n")
+    (insert (compc-generate-freloc-struct))
+    (insert "\n/* Helper functions mirroring src/lisp.h. */\n")
+    (insert "static inline uintptr_t compc_xli (Lisp_Object obj) { return (uintptr_t)obj; }\n")
+    (insert "static inline bool compc_tagged_p (Lisp_Object obj, uintptr_t tag) {\n    uintptr_t value = compc_xli (obj);\n    if (!USE_LSB_TAG) value >>= VALBITS;\n    return ((value - tag) & TAG_MASK) == 0;\n}\n")
+    (insert "static inline bool compc_consp (Lisp_Object obj) { return compc_tagged_p (obj, LISP_CONS_TAG); }\n")
+    (insert "static inline bool compc_floatp (Lisp_Object obj) { return compc_tagged_p (obj, LISP_FLOAT_TAG); }\n")
+    (insert "static inline bool compc_fixnump (Lisp_Object obj) {\n    uintptr_t value = compc_xli (obj);\n    if (!USE_LSB_TAG) value >>= FIXNUM_BITS;\n    uintptr_t tag = (uintptr_t)(LISP_INT0 >> (USE_LSB_TAG ? 0 : 1));\n    return ((value - tag) & INTTYPE_MASK) == 0;\n}\n")
+    (insert "static inline EMACS_INT compc_xfixnum (Lisp_Object obj) {\n    EMACS_INT val = (EMACS_INT)compc_xli (obj);\n    if (!USE_LSB_TAG) { EMACS_UINT u = (EMACS_UINT)val; val = (EMACS_INT)(u << INTTYPEBITS); }\n    return val >> INTTYPEBITS;\n}\n")
+    (insert "static inline Lisp_Object compc_make_fixnum (EMACS_INT n) {\n    EMACS_INT int0 = LISP_INT0;\n    if (USE_LSB_TAG) { EMACS_UINT u = (EMACS_UINT)n; n = (EMACS_INT)(u << INTTYPEBITS); n += int0; }\n    else { n &= INTMASK; n += (int0 << VALBITS); }\n    return (Lisp_Object)n;\n}\n")
+    (insert "static inline char *compc_xcons_ptr (Lisp_Object obj) {\n    return (char *)(compc_xli (obj) - LISP_WORD_TAG (LISP_CONS_TAG));\n}\n")
+    (insert "static inline Lisp_Object compc_xcar (Lisp_Object obj) {\n    return *(Lisp_Object *)(compc_xcons_ptr (obj) + CONS_CAR_OFFSET);\n}\n")
+    (insert "static inline Lisp_Object compc_xcdr (Lisp_Object obj) {\n    return *(Lisp_Object *)(compc_xcons_ptr (obj) + CONS_CDR_OFFSET);\n}\n")
+    (insert "static inline void compc_xsetcar (Lisp_Object obj, Lisp_Object val) {\n    *(Lisp_Object *)(compc_xcons_ptr (obj) + CONS_CAR_OFFSET) = val;\n}\n")
+    (insert "static inline void compc_xsetcdr (Lisp_Object obj, Lisp_Object val) {\n
+*(Lisp_Object *)(compc_xcons_ptr (obj) + CONS_CDR_OFFSET) = val;\n}\n")
+    (insert "static inline Lisp_Object compc_bool_to_lisp (bool value) { return value ? Qt : Qnil; }\n")
+    (insert "static inline bool compc_pure_p (void *ptr) {\n    extern void **pure_reloc;\n    if (!pure_reloc || !*pure_reloc) return false;\n    uintptr_t base = (uintptr_t)(*pure_reloc);\n    uintptr_t offset = (uintptr_t)((char *)ptr - (char *)base);\n    return offset <= (uintptr_t)PURESIZE;\n}\n")
+    (insert "static inline void compc_check_impure (struct freloc_link_table *fn, Lisp_Object obj, void *ptr) {\n    if (compc_pure_p (ptr)) fn->pure_write_error (obj);\n}\n")
+    (insert "static inline bool compc_bignump (struct freloc_link_table *fn, Lisp_Object obj) {\n    if (!compc_tagged_p (obj, LISP_VECTORLIKE_TAG))\n        return false;\n    return fn->helper_PSEUDOVECTOR_TYPEP_XUNTAG (obj, PVEC_BIGNUM);\n}\n")
+    (insert "static inline void compc_maybe_gc_or_quit (struct freloc_link_table *fn) {\n    static unsigned int quitcounter;\n    quitcounter++;\n    if (quitcounter >> 9) { quitcounter = 0; fn->maybe_gc (); fn->maybe_quit (); }\n}\n")
+    (insert "#define TAGGEDP(obj, tag) compc_tagged_p ((obj), (tag))\n")
+    (insert "#define CONSP(obj) compc_consp (obj)\n")
+    (insert "#define FLOATP(obj) compc_floatp (obj)\n")
+    (insert "#define FIXNUMP(obj) compc_fixnump (obj)\n")
+    (insert "#define XFIXNUM(obj) compc_xfixnum (obj)\n")
+    (insert "#define make_fixnum(n) compc_make_fixnum (n)\n")
+    (insert "#define XCAR(obj) compc_xcar (obj)\n")
+    (insert "#define XCDR(obj) compc_xcdr (obj)\n")
+    (insert "#define XSETCAR(obj, val) compc_xsetcar ((obj), (val))\n")
+    (insert "#define XSETCDR(obj, val) compc_xsetcdr ((obj), (val))\n")
+    (insert "#define BOOL_TO_LISP(val) compc_bool_to_lisp (val)\n")
+    (insert "#define BIGNUMP(obj) compc_bignump (fn, (obj))\n")
+    (insert "#define CHECK_IMPURE(obj, ptr) compc_check_impure (fn, (obj), (ptr))\n\n")
+    (insert "/* Static object type */\ntypedef struct { ptrdiff_t len; char data[]; } static_obj_t;\n")
+    (insert "/* Enums for runtime functions */\nenum Set_Internal_Bind { SET_INTERNAL_SET, SET_INTERNAL_BIND, SET_INTERNAL_UNBIND, SET_INTERNAL_THREAD_SWITCH };\n")
+    (insert "/* Handler type enum (must match src/lisp.h) */\nenum handlertype { CATCHER = 0, CONDITION_CASE = 1 };\n\n")
+    (insert "/* Stubs */\nstatic inline Lisp_Object build_string(const char *str) { (void)str; return Qnil; }\n")
+    (insert "static inline Lisp_Object intern_c_string(const char *str) { (void)str; return Qnil; }\n")
+    (insert "static inline Lisp_Object comp_maybe_gc_or_quit(ptrdiff_t n, Lisp_Object *args) { (void)n; (void)args; return Qnil; }\n")
+    (insert "static inline Lisp_Object Fcons(Lisp_Object car, Lisp_Object cdr) { (void)car; (void)cdr; return Qnil; }\n")
 
-/* Basic Lisp_Object type */
-typedef intptr_t Lisp_Object;
-
-/* Constants */
-")
-      (insert (format "#define Qnil ((Lisp_Object)0)
-#define Qt ((Lisp_Object)1)
-#define Qmany ((Lisp_Object)2)
-#define CONST Qnil
-
-/* Thread state */
-struct thread_state {
-    void *dummy;
-};
-
-/* Static object type */
-typedef struct {
-    ptrdiff_t len;
-    char data[];
-} static_obj_t;
-
-/* Fixnum operations */
-#define FIXNUM_BITS (sizeof(Lisp_Object) * 8 - 3)
-
-static inline Lisp_Object make_fixnum(intptr_t n) {
-    return (n << 2) | 2;
-}
-
-static inline intptr_t XFIXNUM(Lisp_Object a) {
-    return a >> 2;
-}
-
-/* Enums for runtime functions */
-enum Set_Internal_Bind {
-    SET_INTERNAL_SET,
-    SET_INTERNAL_BIND,
-    SET_INTERNAL_UNBIND,
-    SET_INTERNAL_THREAD_SWITCH
-};
-
-/* Exception handling support */
-#include <setjmp.h>
-
-/* Handler type enum (must match src/lisp.h) */
-enum handlertype {
-    CATCHER = 0,
-    CONDITION_CASE = 1
-};
-
-/* Opaque handler pointer */
-typedef void* comp_handler_ptr;
-
-/* Thread state relocation (filled by loader) */
-extern void **current_thread_reloc;
-
-/* Computed struct offsets */
-#define HANDLER_VAL_OFFSET %d
-#define HANDLER_NEXT_OFFSET %d
-#define HANDLER_JMP_OFFSET %d
-#define THREAD_HANDLERLIST_OFFSET %d
-
-/* Handler field access macros */
-#define GET_HANDLER_VAL(h) \\
-    (*(Lisp_Object *)((char *)(h) + HANDLER_VAL_OFFSET))
-
-#define GET_HANDLER_NEXT(h) \\
-    (*(comp_handler_ptr *)((char *)(h) + HANDLER_NEXT_OFFSET))
-
-#define GET_HANDLER_JMP(h) \\
-    ((jmp_buf *)((char *)(h) + HANDLER_JMP_OFFSET))
-
-#define GET_HANDLERLIST() \\
-    (*(comp_handler_ptr *)((char *)(*current_thread_reloc) + THREAD_HANDLERLIST_OFFSET))
-
-#define SET_HANDLERLIST(val) \\
-    (*(comp_handler_ptr *)((char *)(*current_thread_reloc) + THREAD_HANDLERLIST_OFFSET) = (val))
-
-/* Stubs */
-static inline Lisp_Object build_string(const char *str) {
-    (void)str;
-    return Qnil;
-}
-
-static inline Lisp_Object intern_c_string(const char *str) {
-    (void)str;
-    return Qnil;
-}
-
-static inline Lisp_Object comp_maybe_gc_or_quit(ptrdiff_t n, Lisp_Object *args) {
-    (void)n; (void)args;
-    return Qnil;
-}
-
-static inline Lisp_Object Fcons(Lisp_Object car, Lisp_Object cdr) {
-    (void)car; (void)cdr;
-    return Qnil;
-}
-" handler-val handler-next handler-jmp thread-handlerlist))))
-
-  (insert "
+    (insert "
 /* Comp unit structure */
 struct Lisp_Native_Comp_Unit {
     Lisp_Object header;
@@ -1045,8 +1276,8 @@ struct Lisp_Native_Comp_Unit {
 
 #define DEFUN(lisp_name, c_name, args) \\
   Lisp_Object c_name args
-
-"))
+"
+            )))
 
 ;;;###autoload
 (defun comphack-codegen-ensure-freloc-h ()
@@ -1071,7 +1302,6 @@ Returns the filename of the freloc header (e.g., \"generated/freloc-2b8d5670.h\"
       (insert (format "#define %s\n\n" guard-name))
       (insert (format "/* Generated for Emacs ABI hash: %s */\n\n" abi-hash))
       (compc-insert-base-definitions)
-      (insert (compc-generate-freloc-struct))
       (insert (format "\n#endif /* %s */\n" guard-name)))
 
     (rename-file tmp-file freloc-file t)

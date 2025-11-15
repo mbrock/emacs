@@ -5731,6 +5731,54 @@ Returns a list (HANDLER-VAL-OFFSET HANDLER-NEXT-OFFSET
 #endif
 }
 
+DEFUN ("comp--header-constants", Fcomp__header_constants,
+       Scomp__header_constants, 0, 0, 0,
+       doc: /* Return plist of constants required by the comphack backend.
+Each element of the result is a keyword followed by the corresponding value.
+The list includes tagging scheme parameters, builtin symbol encodings, and
+structure offsets used when generating the freloc header.  */)
+  (void)
+{
+#ifdef HAVE_NATIVE_COMP
+  Lisp_Object constants = Qnil;
+
+#define PUSH_CONST(NAME, VALUE)                      \
+  do {                                              \
+    constants = Fcons ((VALUE), constants);         \
+    constants = Fcons (intern_c_string (NAME), constants); \
+  } while (0)
+
+  PUSH_CONST (":use-lsb-tag", USE_LSB_TAG ? Qt : Qnil);
+  PUSH_CONST (":gctypebits", make_fixnum (GCTYPEBITS));
+  PUSH_CONST (":valbits", make_fixnum (VALBITS));
+  PUSH_CONST (":inttypebits", make_fixnum (INTTYPEBITS));
+  PUSH_CONST (":lisp-int0", make_fixnum (Lisp_Int0));
+  PUSH_CONST (":lisp-int1", make_fixnum (Lisp_Int1));
+  PUSH_CONST (":lisp-cons", make_fixnum (Lisp_Cons));
+  PUSH_CONST (":lisp-float", make_fixnum (Lisp_Float));
+  PUSH_CONST (":lisp-vectorlike", make_fixnum (Lisp_Vectorlike));
+  PUSH_CONST (":pvec-bignum", make_fixnum (PVEC_BIGNUM));
+  PUSH_CONST (":most-positive-fixnum",
+	     make_fixnum (MOST_POSITIVE_FIXNUM));
+  PUSH_CONST (":most-negative-fixnum",
+	     make_fixnum (MOST_NEGATIVE_FIXNUM));
+  PUSH_CONST (":pure-size", make_fixnum (PURESIZE));
+  PUSH_CONST (":cons-car-offset",
+	     make_fixnum (offsetof (struct Lisp_Cons, u.s.car)));
+  PUSH_CONST (":cons-cdr-offset",
+	     make_fixnum (offsetof (struct Lisp_Cons, u.s.u.cdr)));
+  PUSH_CONST (":qnil", make_fixnum ((EMACS_INT) XLI (Qnil)));
+  PUSH_CONST (":qt", make_fixnum ((EMACS_INT) XLI (Qt)));
+  PUSH_CONST (":qmany", make_fixnum ((EMACS_INT) XLI (Qmany)));
+
+#undef PUSH_CONST
+
+  return constants;
+#else
+  return Qnil;
+#endif
+}
+
 
 
 void
@@ -5878,6 +5926,7 @@ natively-compiled one.  */);
   defsubr (&Scomp__late_register_subr);
   defsubr (&Scomp_runtime_helper_names);
   defsubr (&Scomp__handler_struct_offsets);
+  defsubr (&Scomp__header_constants);
   defsubr (&Snative_elisp_load);
 
   staticpro (&comp.exported_funcs_h);
