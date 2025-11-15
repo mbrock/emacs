@@ -5714,6 +5714,23 @@ DEFUN ("native-comp-available-p", Fnative_comp_available_p,
   return Qnil;
 #endif
 }
+DEFUN ("comp--handler-struct-offsets", Fcomp__handler_struct_offsets,
+       Scomp__handler_struct_offsets, 0, 0, 0,
+       doc: /* Return struct offsets for exception handler implementation.
+Returns a list (HANDLER-VAL-OFFSET HANDLER-NEXT-OFFSET
+              HANDLER-JMP-OFFSET THREAD-HANDLERLIST-OFFSET).  */)
+  (void)
+{
+#ifdef HAVE_NATIVE_COMP
+  return list4 (make_fixnum (offsetof (struct handler, val)),
+		make_fixnum (offsetof (struct handler, next)),
+		make_fixnum (offsetof (struct handler, jmp)),
+		make_fixnum (offsetof (struct thread_state, m_handlerlist)));
+#else
+  return Qnil;
+#endif
+}
+
 
 
 void
@@ -5860,6 +5877,7 @@ natively-compiled one.  */);
   defsubr (&Scomp__register_subr);
   defsubr (&Scomp__late_register_subr);
   defsubr (&Scomp_runtime_helper_names);
+  defsubr (&Scomp__handler_struct_offsets);
   defsubr (&Snative_elisp_load);
 
   staticpro (&comp.exported_funcs_h);

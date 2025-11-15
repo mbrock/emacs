@@ -122,11 +122,17 @@ Returns either a slot number, a constant value wrapper, or a plist representatio
    (t insn)))
 
 (defun comphack--strip-positions (obj)
-  "Strip position info from OBJ if it's a symbol-with-pos.
-For other types, return OBJ unchanged. This is used for hash table keys."
-  (if (symbol-with-pos-p obj)
-      (bare-symbol obj)
-    obj))
+  "Strip position info from OBJ recursively.
+Handles symbols-with-pos, vectors, and conses. This is used for hash table keys."
+  (cond
+   ((symbol-with-pos-p obj)
+    (bare-symbol obj))
+   ((vectorp obj)
+    (vconcat (mapcar #'comphack--strip-positions obj)))
+   ((consp obj)
+    (cons (comphack--strip-positions (car obj))
+          (comphack--strip-positions (cdr obj))))
+   (t obj)))
 
 (defun comphack--extract-data-container (container)
   "Extract serialized data from CONTAINER.
@@ -286,16 +292,20 @@ Returns OUTPUT-FILE on success."
   (interactive "fInput .el file: ")
 
   (let* ((base (file-name-sans-extension input-file))
-         (c-file (concat base ".c"))
+         (c-file (make-temp-file "comphack-" nil ".c"))
          (output-file (or output-file (concat base ".eln"))))
 
-    ;; Step 1: Elisp → C
-    (comphack-compile-to-c input-file c-file)
+    (unwind-protect
+        (progn
+          ;; Step 1: Elisp → C
+          (comphack-compile-to-c input-file c-file)
 
-    ;; Step 2: C → .eln
-    (comphack--compile-c-to-eln c-file output-file)
+          ;; Step 2: C → .eln
+          (comphack--compile-c-to-eln c-file output-file)
 
-    output-file))
+          output-file)
+      ;; Always clean up temporary C file
+      (ignore-errors (delete-file c-file)))))
 
 (defun comphack-compile-comp-ctxt (ctxt output-file &optional keep-c-source)
   "Compile COMP-CTXT (a `comp-ctxt' struct) to OUTPUT-FILE using comphack.

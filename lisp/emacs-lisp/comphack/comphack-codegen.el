@@ -17,15 +17,12 @@
 
 (declare-function comp-mvar-const "comp")
 (declare-function comphack-get-abi-hash "comphack")
+(declare-function comphack--strip-positions "comphack")
+
+(defvar compc--args-many-functions nil
+  "Hash table mapping c-name → t for functions using ARGS_MANY calling convention.")
 
 ;;; Helper Functions
-
-(defun compc--strip-positions (obj)
-  "Strip position info from OBJ if it's a symbol-with-pos.
-For other types, return OBJ unchanged. This is used for hash table keys."
-  (if (symbol-with-pos-p obj)
-      (bare-symbol obj)
-    obj))
 
 ;;; Configuration
 
@@ -39,7 +36,7 @@ For other types, return OBJ unchanged. This is used for hash table keys."
   '((wrong_type_argument . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
     (helper_PSEUDOVECTOR_TYPEP_XUNTAG . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
     (pure_write_error . ("Lisp_Object" "(Lisp_Object)"))
-    (push_handler . ("Lisp_Object" "(Lisp_Object, Lisp_Object)"))
+    (push_handler . ("void*" "(Lisp_Object, int)"))
     (record_unwind_protect_excursion . ("Lisp_Object" "(void)"))
     (helper_unbind_n . ("Lisp_Object" "(Lisp_Object)"))
     (helper_save_restriction . ("Lisp_Object" "(void)"))
@@ -134,18 +131,15 @@ Uses d_reloc when the value lives in the default data vector."
     (`t "Qt")
     ((pred integerp)
      (format "make_fixnum (%d)" val))
-    ((pred vectorp)
-     (error "Unimplemented: vector literals not yet supported in immediates: %S" val))
-    ;; Direct call to create a closure: (direct-call "C-name" slot1 slot2 ...)
-    (`(direct-call ,c-name . ,closure-slots)
-     (if closure-slots
-         (let ((args-str (mapconcat (lambda (slot) (format "s%d" slot))
-                                    closure-slots ", ")))
+    ;; Direct call to create a closure: (direct-call "C-name" arg1 arg2 ...)
+    (`(direct-call ,c-name . ,args)
+     (if args
+         (let ((args-str (mapconcat #'compc-mvar-to-c args ", ")))
            (format "%s (%s)" c-name args-str))
        (format "%s ()" c-name)))
     (_
      ;; Recursively strip position info before lookup
-     (let* ((bare-val (compc--strip-positions val))
+     (let* ((bare-val (comphack--strip-positions val))
             (idx (and compc--d-default-idx
                       (gethash bare-val compc--d-default-idx))))
        (cond
@@ -300,22 +294,64 @@ If DST is non-nil, assigns result to DST."
              (compc-immediate-to-c val)))
 
     (`(set ,dst (callref ,func . ,args))
-     (compc-freloc-call
-      (symbol-name func)
-      (mapcar #'compc-mvar-to-c args)
-      (compc-mvar-to-c dst)))
+     (let ((func-name (symbol-name func)))
+       (cond
+        ;; Fix ARGS_MANY function registration for callref pattern
+        ((equal func-name "comp--register-subr")
+         (let* ((max-arg (nth 3 args))  ; Fourth arg is max-args
+                ;; Extract the max-args value from the mvar
+                (max-val (and (listp max-arg)
+                             (eq (car max-arg) 'mvar)
+                             (plist-get (cdr max-arg) :val)))
+                ;; If max > 3, it's ARGS_MANY (uses (nargs, args) calling convention)
+                (uses-args-many (and (integerp max-val) (> max-val 3)))
+                ;; Replace max arg with Qnil if ARGS_MANY
+                (fixed-args (if uses-args-many
+                               (let ((copy (copy-sequence args)))
+                                 (setf (nth 3 copy) '(mvar :val nil))
+                                 copy)
+                             args))
+                (args-c (mapcar #'compc-mvar-to-c fixed-args)))
+           (compc-freloc-call func-name args-c (compc-mvar-to-c dst))))
+
+        (t
+         (compc-freloc-call
+          func-name
+          (mapcar #'compc-mvar-to-c args)
+          (compc-mvar-to-c dst))))))
 
     (`(set ,dst (call ,func . ,args))
      (let ((func-name (if (symbolp func) (symbol-name func) (format "%s" func))))
-       (if (equal func-name "comp-maybe-gc-or-quit")
-           (format "%s = comp_maybe_gc_or_quit (%d, %s);"
-                   (compc-mvar-to-c dst)
-                   (length args)
-                   (if (zerop (length args)) "NULL"
-                     (format "LIST (%s)" (mapconcat #'compc-mvar-to-c args ", "))))
+       (cond
+        ((equal func-name "comp-maybe-gc-or-quit")
+         (format "%s = comp_maybe_gc_or_quit (%d, %s);"
+                 (compc-mvar-to-c dst)
+                 (length args)
+                 (if (zerop (length args)) "NULL"
+                   (format "LIST (%s)" (mapconcat #'compc-mvar-to-c args ", ")))))
+
+        ;; Fix ARGS_MANY function registration
+        ((equal func-name "comp--register-subr")
+         (let* ((max-arg (nth 3 args))  ; Fourth arg is max-args
+                ;; Extract the max-args value from the mvar
+                (max-val (and (listp max-arg)
+                             (eq (car max-arg) 'mvar)
+                             (plist-get (cdr max-arg) :val)))
+                ;; If max > 3, it's ARGS_MANY (uses (nargs, args) calling convention)
+                (uses-args-many (and (integerp max-val) (> max-val 3)))
+                ;; Replace max arg with Qnil if ARGS_MANY
+                (fixed-args (if uses-args-many
+                               (let ((copy (copy-sequence args)))
+                                 (setf (nth 3 copy) '(mvar :val nil))
+                                 copy)
+                             args))
+                (args-c (mapcar #'compc-mvar-to-c fixed-args)))
+           (compc-freloc-call func-name args-c (compc-mvar-to-c dst))))
+
+        (t
          (compc-freloc-call func-name
                             (mapcar #'compc-mvar-to-c args)
-                            (compc-mvar-to-c dst)))))
+                            (compc-mvar-to-c dst))))))
 
     (`(set ,dst ,src)
      (format "%s = %s;"
@@ -330,14 +366,35 @@ If DST is non-nil, assigns result to DST."
 
     (`(call ,func . ,args)
      (let ((func-name (if (symbolp func) (symbol-name func) (format "%s" func))))
-       (if (equal func-name "comp-maybe-gc-or-quit")
-           (format "comp_maybe_gc_or_quit (%d, %s);"
-                   (length args)
-                   (if (zerop (length args)) "NULL"
-                     (format "LIST (%s)" (mapconcat #'compc-mvar-to-c args ", "))))
+       (cond
+        ((equal func-name "comp-maybe-gc-or-quit")
+         (format "comp_maybe_gc_or_quit (%d, %s);"
+                 (length args)
+                 (if (zerop (length args)) "NULL"
+                   (format "LIST (%s)" (mapconcat #'compc-mvar-to-c args ", ")))))
+
+        ;; Fix ARGS_MANY function registration for standalone calls
+        ((equal func-name "comp--register-subr")
+         (let* ((max-arg (nth 3 args))  ; Fourth arg is max-args
+                ;; Extract the max-args value from the mvar
+                (max-val (and (listp max-arg)
+                             (eq (car max-arg) 'mvar)
+                             (plist-get (cdr max-arg) :val)))
+                ;; If max > 3, it's ARGS_MANY (uses (nargs, args) calling convention)
+                (uses-args-many (and (integerp max-val) (> max-val 3)))
+                ;; Replace max arg with Qnil if ARGS_MANY
+                (fixed-args (if uses-args-many
+                               (let ((copy (copy-sequence args)))
+                                 (setf (nth 3 copy) '(mvar :val nil))
+                                 copy)
+                             args))
+                (args-c (mapcar #'compc-mvar-to-c fixed-args)))
+           (compc-freloc-call func-name args-c nil)))
+
+        (t
          (compc-freloc-call func-name
                             (mapcar #'compc-mvar-to-c args)
-                            nil))))
+                            nil)))))
 
     (`(return ,val)
      (format "return %s;" (compc-mvar-to-c val)))
@@ -371,7 +428,9 @@ If DST is non-nil, assigns result to DST."
     (`(set-par-to-local ,dst ,n)
      (if compc-func-is-fixed-arity
          (format "%s = arg%d;" (compc-mvar-to-c dst) n)
-       (format "%s = args[%d];" (compc-mvar-to-c dst) n)))
+       ;; For ARGS_MANY, parameters are already extracted in entry block
+       ;; so this instruction can be skipped
+       nil))
 
     (`(set-args-to-local ,dst)
      (format "%s = *args++;" (compc-mvar-to-c dst)))
@@ -414,17 +473,35 @@ If DST is non-nil, assigns result to DST."
      ;; Unreachable code marker - no code generation needed
      "/* unreachable */")
 
-    (`(push-handler ,_type ,_handler-num ,_true-bb ,_false-bb)
-     ;; TODO: Exception handling not yet implemented
-     "/* UNIMPLEMENTED: push-handler */")
+    (`(push-handler ,type ,handler-num ,handler-bb ,guarded-bb)
+     ;; Push a new exception handler onto the stack
+     ;; type: handler type (CATCHER=0, CONDITION_CASE=1)
+     ;; handler-num: mvar containing the tag (condition or catch tag)
+     ;; handler-bb: exception caught path (setjmp returned non-zero)
+     ;; guarded-bb: normal execution path (setjmp returned 0)
+     (format "{\n  comp_handler_ptr h = fn->push_handler(%s, %s);\n  if (setjmp(*GET_HANDLER_JMP(h)) == 0)\n    goto %s;\n  else\n    goto %s;\n}"
+             (compc-mvar-to-c handler-num)
+             (if (eq type 'condition-case) "CONDITION_CASE" "CATCHER")
+             guarded-bb
+             handler-bb))
 
     (`(pop-handler)
-     ;; TODO: Exception handling not yet implemented
-     "/* UNIMPLEMENTED: pop-handler */")
+     ;; Remove the current handler from the stack
+     ;; Move handlerlist to the next handler
+     "SET_HANDLERLIST(GET_HANDLER_NEXT(GET_HANDLERLIST()));")
 
-    (`(fetch-handler ,_)
-     ;; TODO: Exception handling not yet implemented
-     "/* UNIMPLEMENTED: fetch-handler */")
+    (`(fetch-handler ,dst)
+     ;; Get the value from the current handler AND pop it
+     ;; This is what comp.c does: save handler, pop it, then get val
+     (format "{\n  comp_handler_ptr h = GET_HANDLERLIST();\n  SET_HANDLERLIST(GET_HANDLER_NEXT(h));\n  %s = GET_HANDLER_VAL(h);\n}"
+             (compc-mvar-to-c dst)))
+
+    ;; Direct call without assignment - just call for side effects
+    (`(direct-call ,c-name . ,args)
+     (if args
+         (let ((args-str (mapconcat #'compc-mvar-to-c args ", ")))
+           (format "%s (%s);" c-name args-str))
+       (format "%s ();" c-name)))
 
     (_ (error "Unknown instruction: %S" insn))))
 
@@ -534,6 +611,8 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
             (if args-macro
                 (compc-insert-line (format "DEFUN (\"%s\", %s, %s)" lisp-name c-name args-macro))
               (compc-insert-line (format "Lisp_Object\n%s (%s)" c-name params))))
+        ;; ARGS_MANY function - record it for fixing registration
+        (puthash c-name t compc--args-many-functions)
         (compc-insert-line (format "DEFUN (\"%s\", %s, ARGS_MANY)" lisp-name c-name)))
 
       (compc-with-block
@@ -563,6 +642,15 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
         (insert ";")
         (insert "\n")
         (insert "\n"))
+
+      ;; For ARGS_MANY functions, extract all parameters from args array
+      ;; This must happen before processing blocks to ensure all parameters
+      ;; are initialized, even if they're unused (optimized away by compiler)
+      (unless fixed-arity
+        (when (and (numberp max-args) (> max-args 0))
+          (dotimes (i max-args)
+            (compc-insert-line
+             (format "s%d = (nargs > %d) ? args[%d] : Qnil;" i i i)))))
 
       ;; First pass: extract PHI assignments
       (let ((phi-map (compc-extract-phi-assignments blocks)))
@@ -652,7 +740,7 @@ unique delimiter to avoid conflicts."
   "Insert global export definitions."
   (compc-insert-line "/* Exports */")
   (compc-insert-line "Lisp_Object comp_unit;")
-  (compc-insert-line "struct thread_state ***current_thread_reloc;")
+  (compc-insert-line "void **current_thread_reloc;")
   (compc-insert-line "bool **f_symbols_with_pos_enabled_reloc;")
   (compc-insert-line "void **pure_reloc;")
   (compc-insert-line "struct freloc_link_table *freloc_link_table;")
@@ -674,6 +762,7 @@ Uses c-mode for proper GNU C coding style indentation."
     (let ((compc--d-default-idx d-default-idx)
           (compc--d-impure-idx d-impure-idx)
           (compc--d-ephemeral-idx d-ephemeral-idx)
+          (compc--args-many-functions (make-hash-table :test 'equal))
           (buffer-undo-list t)
           (inhibit-modification-hooks t))
      ; (c-mode)
@@ -813,7 +902,11 @@ Uses c-mode for proper GNU C coding style indentation."
 
 (defun compc-insert-base-definitions ()
   "Insert minimal type and macro definitions for compiled code."
-  (insert "#include <stddef.h>
+  ;; Get handler struct offsets from Emacs runtime
+  (let ((offsets (comp--handler-struct-offsets)))
+    (cl-destructuring-bind (handler-val handler-next handler-jmp thread-handlerlist)
+        offsets
+      (insert "#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -821,7 +914,8 @@ Uses c-mode for proper GNU C coding style indentation."
 typedef intptr_t Lisp_Object;
 
 /* Constants */
-#define Qnil ((Lisp_Object)0)
+")
+      (insert (format "#define Qnil ((Lisp_Object)0)
 #define Qt ((Lisp_Object)1)
 #define Qmany ((Lisp_Object)2)
 #define CONST Qnil
@@ -856,6 +950,43 @@ enum Set_Internal_Bind {
     SET_INTERNAL_THREAD_SWITCH
 };
 
+/* Exception handling support */
+#include <setjmp.h>
+
+/* Handler type enum (must match src/lisp.h) */
+enum handlertype {
+    CATCHER = 0,
+    CONDITION_CASE = 1
+};
+
+/* Opaque handler pointer */
+typedef void* comp_handler_ptr;
+
+/* Thread state relocation (filled by loader) */
+extern void **current_thread_reloc;
+
+/* Computed struct offsets */
+#define HANDLER_VAL_OFFSET %d
+#define HANDLER_NEXT_OFFSET %d
+#define HANDLER_JMP_OFFSET %d
+#define THREAD_HANDLERLIST_OFFSET %d
+
+/* Handler field access macros */
+#define GET_HANDLER_VAL(h) \\
+    (*(Lisp_Object *)((char *)(h) + HANDLER_VAL_OFFSET))
+
+#define GET_HANDLER_NEXT(h) \\
+    (*(comp_handler_ptr *)((char *)(h) + HANDLER_NEXT_OFFSET))
+
+#define GET_HANDLER_JMP(h) \\
+    ((jmp_buf *)((char *)(h) + HANDLER_JMP_OFFSET))
+
+#define GET_HANDLERLIST() \\
+    (*(comp_handler_ptr *)((char *)(*current_thread_reloc) + THREAD_HANDLERLIST_OFFSET))
+
+#define SET_HANDLERLIST(val) \\
+    (*(comp_handler_ptr *)((char *)(*current_thread_reloc) + THREAD_HANDLERLIST_OFFSET) = (val))
+
 /* Stubs */
 static inline Lisp_Object build_string(const char *str) {
     (void)str;
@@ -876,7 +1007,9 @@ static inline Lisp_Object Fcons(Lisp_Object car, Lisp_Object cdr) {
     (void)car; (void)cdr;
     return Qnil;
 }
+" handler-val handler-next handler-jmp thread-handlerlist))))
 
+  (insert "
 /* Comp unit structure */
 struct Lisp_Native_Comp_Unit {
     Lisp_Object header;
