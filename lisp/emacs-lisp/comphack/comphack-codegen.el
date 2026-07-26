@@ -1297,8 +1297,11 @@ struct Lisp_Native_Comp_Unit {
 Returns the filename of the freloc header (e.g., \"generated/freloc-2b8d5670.h\")."
   (require 'comphack)
   (let* ((abi-hash (comphack-get-abi-hash))
-         (base-dir (or (and load-file-name (file-name-directory load-file-name))
-                       (and (boundp 'comphack-base-dir) comphack-base-dir)
+         ;; `load-file-name' is dynamically bound and may name the Lisp file
+         ;; whose loading happened to request compilation.  Keep generated
+         ;; headers rooted at the Comphack installation instead.
+         (base-dir (or (and (boundp 'comphack-base-dir) comphack-base-dir)
+                       (and load-file-name (file-name-directory load-file-name))
                        default-directory))
          (gen-dir (expand-file-name "generated" base-dir))
          (freloc-filename (format "freloc-%s.h" abi-hash))

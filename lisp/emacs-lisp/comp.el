@@ -3328,7 +3328,11 @@ Prepare every function for final compilation and drive the C back-end."
                     (file-exists-p comphack-emacs-source-dir)
                     comphack-emacs-source-dir)
                (and (getenv "EMACS_SRC") (getenv "EMACS_SRC"))
-               default-src)))
+               default-src))
+          ;; The C emitter recursively walks serialized compiler objects.
+          ;; Large generated tables such as `ucs-normalize.el' legitimately
+          ;; exceed the bootstrap byte compiler's 3400-frame allowance.
+          (max-lisp-eval-depth (max max-lisp-eval-depth 20000)))
       (comphack-compile-comp-ctxt comp-ctxt output))))
 
 (defvar comp-async-compilation nil

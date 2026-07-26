@@ -5932,6 +5932,7 @@ natively-compiled one.  */);
   defsubr (&Scomp__subr_signature);
   defsubr (&Scomp_el_to_eln_rel_filename);
   defsubr (&Scomp_el_to_eln_filename);
+  defsubr (&Scomp__install_trampoline);
 #ifdef HAVE_NATIVE_COMP_GCCJIT
   defsubr (&Scomp_native_driver_options_effective_p);
   defsubr (&Scomp_native_compiler_options_effective_p);
