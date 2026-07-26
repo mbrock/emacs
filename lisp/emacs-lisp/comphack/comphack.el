@@ -36,10 +36,37 @@
       "unknown"))
 
 (defvar comphack-compiler-flags
-  '("-shared" "-fPIC" "-O0" "-w"
-    "-fno-stack-protector" "-fno-toplevel-reorder")
-  "Flags passed to the compiler when compiling C to .eln.
-The -fno-toplevel-reorder flag is critical to preserve blob declaration order.")
+  '("-shared" "-fPIC" "-O0" "-w" "-fno-stack-protector")
+  "Portable flags passed to the compiler when compiling C to .eln.")
+
+(defvar comphack--compiler-specific-flags-cache nil
+  "Alist caching compiler-specific flags by compiler executable.")
+
+(defun comphack--gcc-version-output-p (output)
+  "Return non-nil when compiler version OUTPUT identifies GCC, not Clang."
+  (and (not (string-match-p "\\bclang\\b" output))
+       (string-match-p
+        "\\(?:\\bgcc\\b\\|Free Software Foundation\\)"
+        output)))
+
+(defun comphack--compiler-specific-flags ()
+  "Return flags required by `native-comp-comphack-cc'.
+GCC may reorder top-level objects, which breaks the blob layout expected by
+the native loader.  Clang, including Fil-C Clang, does not accept GCC's
+`-fno-toplevel-reorder' option."
+  (let ((cached (assoc native-comp-comphack-cc
+                       comphack--compiler-specific-flags-cache)))
+    (if cached
+        (cdr cached)
+      (let ((flags
+             (with-temp-buffer
+               (when (and (zerop (call-process native-comp-comphack-cc
+                                                nil t nil "--version"))
+                          (comphack--gcc-version-output-p (buffer-string)))
+                 '("-fno-toplevel-reorder")))))
+        (push (cons native-comp-comphack-cc flags)
+              comphack--compiler-specific-flags-cache)
+        flags))))
 
 (defvar comphack-linker-flags
   (when (memq system-type '(gnu gnu/linux gnu/kfreebsd berkeley-unix usg-unix-v))
@@ -412,6 +439,7 @@ Signals error if compilation fails."
             (make-temp-file
              (expand-file-name ".comphack-" eln-directory) nil ".eln"))
            (all-flags (append comphack-compiler-flags
+                              (comphack--compiler-specific-flags)
                               (when (> native-comp-debug 0) '("-g"))
                               comphack-linker-flags
                               native-comp-comphack-extra-flags

@@ -1275,7 +1275,13 @@ Uses c-mode for proper GNU C coding style indentation."
          (qmany (compc--const-int constants :qmany)))
     (insert "#include <stddef.h>\n#include <stdint.h>\n#include <stdbool.h>\n#include <limits.h>\n#include <setjmp.h>\n\n")
     (insert "struct freloc_link_table;\n\n")
-    (insert "/* Basic Lisp types */\ntypedef intptr_t Lisp_Object;\n")
+    (insert "/* Basic Lisp types.
+Fil-C needs Lisp_Object to remain pointer-typed so capabilities survive calls
+between Emacs and an ELN.  Immediate values still use pointer-shaped tagged
+constants, just as they do in src/lisp.h. */\n")
+    (insert "#ifdef __FILC__\n")
+    (insert "struct Lisp_X;\ntypedef struct Lisp_X *Lisp_Object;\n")
+    (insert "#else\ntypedef intptr_t Lisp_Object;\n#endif\n")
     (insert "typedef intptr_t EMACS_INT;\ntypedef uintptr_t EMACS_UINT;\n\n")
     (insert "/* Constants derived from the running Emacs. */\n")
     (insert (format "#define USE_LSB_TAG %d\n" use-lsb))
@@ -1323,7 +1329,12 @@ Uses c-mode for proper GNU C coding style indentation."
     (insert "static inline bool compc_fixnump (Lisp_Object obj) {\n    uintptr_t value = compc_xli (obj);\n    if (!USE_LSB_TAG) value >>= FIXNUM_BITS;\n    uintptr_t tag = (uintptr_t)(LISP_INT0 >> (USE_LSB_TAG ? 0 : 1));\n    return ((value - tag) & INTTYPE_MASK) == 0;\n}\n")
     (insert "static inline EMACS_INT compc_xfixnum (Lisp_Object obj) {\n    EMACS_INT val = (EMACS_INT)compc_xli (obj);\n    if (!USE_LSB_TAG) { EMACS_UINT u = (EMACS_UINT)val; val = (EMACS_INT)(u << INTTYPEBITS); }\n    return val >> INTTYPEBITS;\n}\n")
     (insert "static inline Lisp_Object compc_make_fixnum (EMACS_INT n) {\n    EMACS_INT int0 = LISP_INT0;\n    if (USE_LSB_TAG) { EMACS_UINT u = (EMACS_UINT)n; n = (EMACS_INT)(u << INTTYPEBITS); n += int0; }\n    else { n &= INTMASK; n += (int0 << VALBITS); }\n    return (Lisp_Object)n;\n}\n")
-    (insert "static inline char *compc_xcons_ptr (Lisp_Object obj) {\n    return (char *)(compc_xli (obj) - LISP_WORD_TAG (LISP_CONS_TAG));\n}\n")
+    (insert "static inline char *compc_xcons_ptr (Lisp_Object obj) {\n")
+    (insert "#ifdef __FILC__\n")
+    (insert "    return (char *)obj - LISP_WORD_TAG (LISP_CONS_TAG);\n")
+    (insert "#else\n")
+    (insert "    return (char *)(compc_xli (obj) - LISP_WORD_TAG (LISP_CONS_TAG));\n")
+    (insert "#endif\n}\n")
     (insert "static inline Lisp_Object compc_xcar (Lisp_Object obj) {\n    return *(Lisp_Object *)(compc_xcons_ptr (obj) + CONS_CAR_OFFSET);\n}\n")
     (insert "static inline Lisp_Object compc_xcdr (Lisp_Object obj) {\n    return *(Lisp_Object *)(compc_xcons_ptr (obj) + CONS_CDR_OFFSET);\n}\n")
     (insert "static inline void compc_xsetcar (Lisp_Object obj, Lisp_Object val) {\n    *(Lisp_Object *)(compc_xcons_ptr (obj) + CONS_CAR_OFFSET) = val;\n}\n")
