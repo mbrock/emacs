@@ -150,43 +150,54 @@ Returns either a slot number, a constant value wrapper, or a plist representatio
 
 (defun comphack--contains-positioned-symbol-p (obj &optional seen)
   "Return non-nil if OBJ contains a symbol-with-position."
-  (let ((seen (or seen (make-hash-table :test #'eq))))
-    (cond
-     ((symbol-with-pos-p obj) t)
-     ((or (consp obj) (vectorp obj))
-      (unless (gethash obj seen)
-        (puthash obj t seen)
-        (if (consp obj)
-            (or (comphack--contains-positioned-symbol-p (car obj) seen)
-                (comphack--contains-positioned-symbol-p (cdr obj) seen))
-          (catch 'found
-            (dotimes (i (length obj))
-              (when (comphack--contains-positioned-symbol-p
-                     (aref obj i) seen)
-                (throw 'found t)))))))
-     (t nil))))
+  (let ((seen (or seen (make-hash-table :test #'eq)))
+        (pending (list obj)))
+    (catch 'found
+      (while pending
+        (let ((value (pop pending)))
+          (cond
+           ((symbol-with-pos-p value)
+            (throw 'found t))
+           ((and (consp value) (not (gethash value seen)))
+            (puthash value t seen)
+            (push (car value) pending)
+            (push (cdr value) pending))
+           ((and (vectorp value) (not (gethash value seen)))
+            (puthash value t seen)
+            (dotimes (i (length value))
+              (push (aref value i) pending))))))
+      nil)))
 
 (defun comphack--copy-without-positions (obj seen)
   "Copy OBJ into graph SEEN while stripping symbol positions."
-  (cond
-   ((symbol-with-pos-p obj)
-    (bare-symbol obj))
-   ((vectorp obj)
-    (or (gethash obj seen)
-        (let ((copy (make-vector (length obj) nil)))
-          (puthash obj copy seen)
-          (dotimes (i (length obj))
-            (aset copy i (comphack--copy-without-positions
-                          (aref obj i) seen)))
-          copy)))
-   ((consp obj)
-    (or (gethash obj seen)
-        (let ((copy (cons nil nil)))
-          (puthash obj copy seen)
-          (setcar copy (comphack--copy-without-positions (car obj) seen))
-          (setcdr copy (comphack--copy-without-positions (cdr obj) seen))
-          copy)))
-   (t obj)))
+  (let (pending)
+    (cl-labels
+        ((copy-value
+          (value)
+          (cond
+           ((symbol-with-pos-p value)
+            (bare-symbol value))
+           ((or (consp value) (vectorp value))
+            (or (gethash value seen)
+                (let ((copy (if (consp value)
+                                (cons nil nil)
+                              (make-vector (length value) nil))))
+                  (puthash value copy seen)
+                  (push (vector value copy) pending)
+                  copy)))
+           (t value))))
+      (let ((result (copy-value obj)))
+        (while pending
+          (let* ((pair (pop pending))
+                 (source (aref pair 0))
+                 (copy (aref pair 1)))
+            (if (consp source)
+                (progn
+                  (setcar copy (copy-value (car source)))
+                  (setcdr copy (copy-value (cdr source))))
+              (dotimes (i (length source))
+                (aset copy i (copy-value (aref source i)))))))
+        result))))
 
 (defun comphack--strip-positions (obj)
   "Strip position info from OBJ recursively.

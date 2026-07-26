@@ -96,41 +96,54 @@ give differing functions differing names while preserving reproducible builds."
 (defun compc--replace-c-names (obj &optional seen)
   "Copy OBJ, replacing strings found in `compc--c-name-map'.
 Preserve sharing and circular structure using SEEN."
-  (let ((seen (or seen (make-hash-table :test #'eq))))
-    (cond
-     ((stringp obj) (compc--mapped-c-name obj))
-     ((vectorp obj)
-      (or (gethash obj seen)
-          (let ((copy (make-vector (length obj) nil)))
-            (puthash obj copy seen)
-            (dotimes (i (length obj))
-              (aset copy i (compc--replace-c-names (aref obj i) seen)))
-            copy)))
-     ((consp obj)
-      (or (gethash obj seen)
-          (let ((copy (cons nil nil)))
-            (puthash obj copy seen)
-            (setcar copy (compc--replace-c-names (car obj) seen))
-            (setcdr copy (compc--replace-c-names (cdr obj) seen))
-            copy)))
-     (t obj))))
+  (let ((seen (or seen (make-hash-table :test #'eq)))
+        pending)
+    (cl-labels
+        ((copy-value
+          (value)
+          (cond
+           ((stringp value) (compc--mapped-c-name value))
+           ((or (consp value) (vectorp value))
+            (or (gethash value seen)
+                (let ((copy (if (consp value)
+                                (cons nil nil)
+                              (make-vector (length value) nil))))
+                  (puthash value copy seen)
+                  (push (vector value copy) pending)
+                  copy)))
+           (t value))))
+      (let ((result (copy-value obj)))
+        (while pending
+          (let* ((pair (pop pending))
+                 (source (aref pair 0))
+                 (copy (aref pair 1)))
+            (if (consp source)
+                (progn
+                  (setcar copy (copy-value (car source)))
+                  (setcdr copy (copy-value (cdr source))))
+              (dotimes (i (length source))
+                (aset copy i (copy-value (aref source i)))))))
+        result))))
 
 (defun compc--tree-memq (needle tree &optional seen)
   "Return non-nil when NEEDLE occurs in TREE, tolerating circular structure."
-  (let ((seen (or seen (make-hash-table :test #'eq))))
-    (cond
-     ((eq needle tree) t)
-     ((or (consp tree) (vectorp tree))
-      (unless (gethash tree seen)
-        (puthash tree t seen)
-        (if (consp tree)
-            (or (compc--tree-memq needle (car tree) seen)
-                (compc--tree-memq needle (cdr tree) seen))
-          (catch 'found
-            (dotimes (i (length tree))
-              (when (compc--tree-memq needle (aref tree i) seen)
-                (throw 'found t)))))))
-     (t nil))))
+  (let ((seen (or seen (make-hash-table :test #'eq)))
+        (pending (list tree)))
+    (catch 'found
+      (while pending
+        (let ((value (pop pending)))
+          (cond
+           ((eq needle value)
+            (throw 'found t))
+           ((and (consp value) (not (gethash value seen)))
+            (puthash value t seen)
+            (push (car value) pending)
+            (push (cdr value) pending))
+           ((and (vectorp value) (not (gethash value seen)))
+            (puthash value t seen)
+            (dotimes (i (length value))
+              (push (aref value i) pending))))))
+      nil)))
 
 (defun compc--runtime-helper-symbols ()
   "Return helper symbols as provided by the runtime."
@@ -743,15 +756,16 @@ If DST is non-nil, assigns result to DST."
        nil))
 
     (`(set-args-to-local ,dst)
-     (format "%s = *args++;" (compc-mvar-to-c dst)))
+     (format "%s = *args;" (compc-mvar-to-c dst)))
 
     (`(inc-args)
-     "/* inc-args handled by set-args-to-local */")
+     (unless compc-func-is-fixed-arity
+       "args++;"))
 
     (`(set-rest-args-to-local ,dst)
      ;; From comp.c: local[slot] = list (nargs - slot, args);
-     ;; In our case, args pointer has already been incremented by set-args-to-local
-     ;; so we need to find the slot number to know how many args were consumed
+     ;; The args pointer has been advanced by the preceding inc-args
+     ;; instructions, so use the slot to compute the remaining count.
      (let* ((slot (cond
                    ((comp-mvar-p dst) (comp-mvar-slot dst))
                    ((and (listp dst) (eq (car dst) 'mvar))
@@ -835,6 +849,11 @@ If DST is non-nil, assigns result to DST."
                (args-clean (cond
                             ((comp-args-p args)
                              (list (aref args 1) (aref args 2)))
+                            ((comp-nargs-p args)
+                             (list (comp-nargs-min args)
+                                   (if (comp-nargs-rest args)
+                                       'many
+                                     (comp-nargs-nonrest args))))
                             ((consp args) args)
                             (t (list 0 0))))
                (min-args (car args-clean))
