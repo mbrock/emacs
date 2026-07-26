@@ -28,7 +28,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 #include <libgccjit.h>
+#endif
 #include <epaths.h>
 
 #include "puresize.h"
@@ -466,10 +468,29 @@ load_gccjit_if_necessary (bool mandatory)
   return true;
 #endif
 }
+#else /* !HAVE_NATIVE_COMP_GCCJIT */
+static bool
+load_gccjit_if_necessary (bool mandatory)
+{
+  return false;
+}
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 
 /* Increase this number to force a new Vcomp_abi_hash to be generated.  */
 #define ABI_VERSION "6"
+
+#ifndef NATIVE_COMP_DEFAULT_BACKEND
+# define NATIVE_COMP_DEFAULT_BACKEND "gccjit"
+#endif
+
+#ifndef COMPHACK_DEFAULT_CC
+# define COMPHACK_DEFAULT_CC "cc"
+#endif
+
+#ifndef COMPHACK_DEFAULT_CC_FLAGS
+# define COMPHACK_DEFAULT_CC_FLAGS ""
+#endif
 
 /* Length of the hashes used for eln file naming.  */
 #define HASH_LENGTH 8
@@ -548,6 +569,7 @@ static f_reloc_t freloc;
 # define NUM_CAST_TYPES 15
 #endif
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 typedef struct {
   EMACS_INT len;
   gcc_jit_rvalue *r_val;
@@ -676,6 +698,7 @@ typedef struct {
 } comp_t;
 
 static comp_t comp;
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 static FILE *logfile;
 
@@ -685,10 +708,12 @@ typedef struct {
   char data[];
 } static_obj_t;
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 typedef struct {
   reloc_array_t array;
   gcc_jit_rvalue *idx;
 } imm_reloc_t;
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 
 /*
@@ -704,24 +729,44 @@ helper_GET_SYMBOL_WITH_POSITION (Lisp_Object);
 static Lisp_Object
 helper_sanitizer_assert (Lisp_Object, Lisp_Object);
 
+#define COMP_RUNTIME_HELPERS(_)        \
+   _ (wrong_type_argument)              \
+   _ (helper_PSEUDOVECTOR_TYPEP_XUNTAG) \
+   _ (pure_write_error)                 \
+   _ (push_handler)                     \
+   _ (record_unwind_protect_excursion)  \
+   _ (helper_unbind_n)                  \
+   _ (helper_save_restriction)          \
+   _ (helper_GET_SYMBOL_WITH_POSITION)  \
+   _ (helper_sanitizer_assert)          \
+   _ (record_unwind_current_buffer)     \
+   _ (set_internal)                     \
+   _ (helper_unwind_protect)            \
+   _ (specbind)                         \
+   _ (maybe_gc)                         \
+   _ (maybe_quit)
+
 /* Note: helper_link_table must match the list created by
    `declare_runtime_imported_funcs'.  */
-static void *helper_link_table[] =
-  { wrong_type_argument,
-    helper_PSEUDOVECTOR_TYPEP_XUNTAG,
-    pure_write_error,
-    push_handler,
-    record_unwind_protect_excursion,
-    helper_unbind_n,
-    helper_save_restriction,
-    helper_GET_SYMBOL_WITH_POSITION,
-    helper_sanitizer_assert,
-    record_unwind_current_buffer,
-    set_internal,
-    helper_unwind_protect,
-    specbind,
-    maybe_gc,
-    maybe_quit };
+static void *helper_link_table[] = {
+#define COMP_RUNTIME_HELPER_PTR(name) name,
+  COMP_RUNTIME_HELPERS (COMP_RUNTIME_HELPER_PTR)
+#undef COMP_RUNTIME_HELPER_PTR
+};
+
+DEFUN ("comp-runtime-helper-names", Fcomp_runtime_helper_names,
+       Scomp_runtime_helper_names, 0, 0, 0,
+       doc: /* Return list of runtime helper symbols used in freloc tables.
+The order matches the helper section that precedes subrs in each table.  */)
+(void)
+{
+  Lisp_Object acc = Qnil;
+#define COMP_RUNTIME_HELPER_CONS(name) \
+   acc = Fcons (intern_c_string (#name), acc);
+  COMP_RUNTIME_HELPERS (COMP_RUNTIME_HELPER_CONS)
+#undef COMP_RUNTIME_HELPER_CONS
+  return Fnreverse (acc);
+}
 
 
 static char * ATTRIBUTE_FORMAT_PRINTF (1, 2)
@@ -877,6 +922,7 @@ bcall0 (Lisp_Object f)
   Ffuncall (1, &f);
 }
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 static gcc_jit_block *
 retrieve_block (Lisp_Object block_name)
 {
@@ -4378,6 +4424,7 @@ compile_function (Lisp_Object func)
   SAFE_FREE ();
 }
 
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 /**********************************/
 /* Entry points exposed to lisp.  */
@@ -4599,6 +4646,7 @@ DEFUN ("comp--install-trampoline", Fcomp__install_trampoline,
     return Qnil;
 }
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 DEFUN ("comp--init-ctxt", Fcomp__init_ctxt, Scomp__init_ctxt,
        0, 0, 0,
        doc: /* Initialize the native compiler context.
@@ -5049,6 +5097,8 @@ unknown (before GCC version 10).  */)
 }
 #pragma GCC diagnostic pop
 
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
+
 
 /******************************************************************************/
 /* Helper functions called from the run-time.				      */
@@ -5153,6 +5203,7 @@ eln_load_path_final_clean_up (void)
 
 /* This function puts the compilation unit in the
   `Vcomp_loaded_comp_units_h` hashmap.  */
+
 static void
 register_native_comp_unit (Lisp_Object comp_u)
 {
@@ -5492,6 +5543,7 @@ native_function_doc (Lisp_Object function)
   return AREF (cu->data_fdoc_v, XSUBR (function)->doc);
 }
 
+
 static Lisp_Object
 make_subr (Lisp_Object symbol_name, Lisp_Object minarg, Lisp_Object maxarg,
 	   Lisp_Object c_name, Lisp_Object type, Lisp_Object doc_idx,
@@ -5538,7 +5590,6 @@ make_subr (Lisp_Object symbol_name, Lisp_Object minarg, Lisp_Object maxarg,
 #endif
   Lisp_Object tem;
   XSETSUBR (tem, &x->s);
-
   return tem;
 }
 
@@ -5669,7 +5720,6 @@ LATE-LOAD has to be non-nil when loading for deferred compilation.  */)
   return load_comp_unit (comp_u, false, !NILP (late_load));
 }
 
-#endif /* HAVE_NATIVE_COMP */
 
 DEFUN ("native-comp-available-p", Fnative_comp_available_p,
        Snative_comp_available_p, 0, 0, 0,
@@ -5682,6 +5732,71 @@ DEFUN ("native-comp-available-p", Fnative_comp_available_p,
   return Qnil;
 #endif
 }
+DEFUN ("comp--handler-struct-offsets", Fcomp__handler_struct_offsets,
+       Scomp__handler_struct_offsets, 0, 0, 0,
+       doc: /* Return struct offsets for exception handler implementation.
+Returns a list (HANDLER-VAL-OFFSET HANDLER-NEXT-OFFSET
+              HANDLER-JMP-OFFSET THREAD-HANDLERLIST-OFFSET).  */)
+  (void)
+{
+#ifdef HAVE_NATIVE_COMP
+  return list4 (make_fixnum (offsetof (struct handler, val)),
+		make_fixnum (offsetof (struct handler, next)),
+		make_fixnum (offsetof (struct handler, jmp)),
+		make_fixnum (offsetof (struct thread_state, m_handlerlist)));
+#else
+  return Qnil;
+#endif
+}
+
+DEFUN ("comp--header-constants", Fcomp__header_constants,
+       Scomp__header_constants, 0, 0, 0,
+       doc: /* Return plist of constants required by the comphack backend.
+Each element of the result is a keyword followed by the corresponding value.
+The list includes tagging scheme parameters, builtin symbol encodings, and
+structure offsets used when generating the freloc header.  */)
+  (void)
+{
+#ifdef HAVE_NATIVE_COMP
+  Lisp_Object constants = Qnil;
+
+#define PUSH_CONST(NAME, VALUE)                      \
+  do {                                              \
+    constants = Fcons ((VALUE), constants);         \
+    constants = Fcons (intern_c_string (NAME), constants); \
+  } while (0)
+
+  PUSH_CONST (":use-lsb-tag", USE_LSB_TAG ? Qt : Qnil);
+  PUSH_CONST (":gctypebits", make_fixnum (GCTYPEBITS));
+  PUSH_CONST (":valbits", make_fixnum (VALBITS));
+  PUSH_CONST (":inttypebits", make_fixnum (INTTYPEBITS));
+  PUSH_CONST (":lisp-int0", make_fixnum (Lisp_Int0));
+  PUSH_CONST (":lisp-int1", make_fixnum (Lisp_Int1));
+  PUSH_CONST (":lisp-cons", make_fixnum (Lisp_Cons));
+  PUSH_CONST (":lisp-float", make_fixnum (Lisp_Float));
+  PUSH_CONST (":lisp-vectorlike", make_fixnum (Lisp_Vectorlike));
+  PUSH_CONST (":pvec-bignum", make_fixnum (PVEC_BIGNUM));
+  PUSH_CONST (":most-positive-fixnum",
+	     make_fixnum (MOST_POSITIVE_FIXNUM));
+  PUSH_CONST (":most-negative-fixnum",
+	     make_fixnum (MOST_NEGATIVE_FIXNUM));
+  PUSH_CONST (":pure-size", make_fixnum (PURESIZE));
+  PUSH_CONST (":cons-car-offset",
+	     make_fixnum (offsetof (struct Lisp_Cons, u.s.car)));
+  PUSH_CONST (":cons-cdr-offset",
+	     make_fixnum (offsetof (struct Lisp_Cons, u.s.u.cdr)));
+  PUSH_CONST (":qnil", make_fixnum ((EMACS_INT) XLI (Qnil)));
+  PUSH_CONST (":qt", make_fixnum ((EMACS_INT) XLI (Qt)));
+  PUSH_CONST (":qmany", make_fixnum ((EMACS_INT) XLI (Qmany)));
+
+#undef PUSH_CONST
+
+  return constants;
+#else
+  return Qnil;
+#endif
+}
+
 
 
 void
@@ -5817,18 +5932,26 @@ natively-compiled one.  */);
   defsubr (&Scomp__subr_signature);
   defsubr (&Scomp_el_to_eln_rel_filename);
   defsubr (&Scomp_el_to_eln_filename);
+  defsubr (&Scomp__install_trampoline);
+#ifdef HAVE_NATIVE_COMP_GCCJIT
   defsubr (&Scomp_native_driver_options_effective_p);
   defsubr (&Scomp_native_compiler_options_effective_p);
-  defsubr (&Scomp__install_trampoline);
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
+#ifdef HAVE_NATIVE_COMP_GCCJIT
   defsubr (&Scomp__init_ctxt);
   defsubr (&Scomp__release_ctxt);
   defsubr (&Scomp__compile_ctxt_to_file0);
   defsubr (&Scomp_libgccjit_version);
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
   defsubr (&Scomp__register_lambda);
   defsubr (&Scomp__register_subr);
   defsubr (&Scomp__late_register_subr);
+  defsubr (&Scomp_runtime_helper_names);
+  defsubr (&Scomp__handler_struct_offsets);
+  defsubr (&Scomp__header_constants);
   defsubr (&Snative_elisp_load);
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
   staticpro (&comp.exported_funcs_h);
   comp.exported_funcs_h = Qnil;
   staticpro (&comp.imported_funcs_h);
@@ -5836,6 +5959,7 @@ natively-compiled one.  */);
   staticpro (&comp.func_blocks_h);
   staticpro (&comp.emitter_dispatcher);
   comp.emitter_dispatcher = Qnil;
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
   staticpro (&loadsearch_re_list);
   loadsearch_re_list = Qnil;
 
@@ -5879,6 +6003,23 @@ Emacs.  */);
      `invocation-directory' is still unset, will be fixed up during
      dump reload.  */
   Vnative_comp_eln_load_path = Fcons (build_string ("../native-lisp/"), Qnil);
+
+  DEFVAR_LISP ("native-comp-configured-backend",
+	       Vnative_comp_configured_backend,
+    doc: /* Backend selected at configure time for native compilation.  */);
+  Vnative_comp_configured_backend =
+    intern_c_string (NATIVE_COMP_DEFAULT_BACKEND);
+
+  DEFVAR_LISP ("native-comp-configured-comphack-cc",
+	       Vnative_comp_configured_comphack_cc,
+    doc: /* Compiler command configured for the comphack backend.  */);
+  Vnative_comp_configured_comphack_cc = build_string (COMPHACK_DEFAULT_CC);
+
+  DEFVAR_LISP ("native-comp-configured-comphack-cc-flags",
+	       Vnative_comp_configured_comphack_cc_flags,
+    doc: /* Compiler flags configured for the comphack backend.  */);
+  Vnative_comp_configured_comphack_cc_flags =
+    build_string (COMPHACK_DEFAULT_CC_FLAGS);
 
   DEFVAR_LISP ("native-comp-enable-subr-trampolines",
 	       Vnative_comp_enable_subr_trampolines,

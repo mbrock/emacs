@@ -131,6 +131,8 @@ lisp/cedet/srecode/srt-wy.el
 lisp/cedet/semantic/grammar-wy.el
 lisp/eshell/esh-module-loaddefs.el
 lisp/eshell/esh-groups.el
+lisp/emacs-lisp/subdirs.el
+lisp/emacs-lisp/comphack/generated/
 lisp/finder-inf.el
 lisp/leim/ja-dic/
 leim/small-ja-dic-option

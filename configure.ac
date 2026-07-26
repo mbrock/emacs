@@ -1749,6 +1749,35 @@ AC_ARG_WITH([native-compilation],
 )
 AC_SUBST([NATIVE_COMPILATION_AOT])
 
+native_comp_backend=gccjit
+AC_ARG_WITH([native-compilation-backend],
+  [AS_HELP_STRING([--with-native-compilation-backend@<:@=BACKEND@:>@],
+                  [select the native compilation backend: 'gccjit' (default) or 'comphack'.])],
+  [case $withval in
+     auto|gccjit) native_comp_backend=gccjit ;;
+     comphack) native_comp_backend=comphack ;;
+     *) AC_MSG_ERROR([bad value $withval for native-compilation-backend option]) ;;
+   esac])
+AC_SUBST([NATIVE_COMP_BACKEND], [$native_comp_backend])
+
+comphack_cc=${CC}
+AC_ARG_WITH([comphack-cc],
+  [AS_HELP_STRING([--with-comphack-cc=PROGRAM],
+                  [compiler command comphack should use when building .eln files (for example, gcc or tcc).])],
+  [if test "x$withval" != x; then
+     comphack_cc=$withval
+   fi])
+AC_SUBST([COMPHACK_CC], [$comphack_cc])
+
+comphack_cc_flags=
+AC_ARG_WITH([comphack-cc-flags],
+  [AS_HELP_STRING([--with-comphack-cc-flags=FLAGS],
+                  [additional compiler flags for comphack builds.])],
+  [if test "x$withval" != x; then
+     comphack_cc_flags=$withval
+   fi])
+AC_SUBST([COMPHACK_CC_FLAGS], [$comphack_cc_flags])
+
 AC_ARG_ENABLE([check-lisp-object-type],
   [AS_HELP_STRING([--enable-check-lisp-object-type],
      [Enable compile time checks for the Lisp_Object data type,
@@ -5147,8 +5176,12 @@ source on this site:
 <https://gcc.gnu.org/wiki/JIT>.])])
 
 HAVE_NATIVE_COMP=no
+HAVE_NATIVE_COMP_GCCJIT=no
+HAVE_NATIVE_COMP_COMPHACK=no
 LIBGCCJIT_LIBS=
 LIBGCCJIT_CFLAGS=
+native_comp_backend_request=$native_comp_backend
+native_comp_backend_resolved=$native_comp_backend
 if test "$canonical" = i686-pc-cygwin; then
   if test "${with_cygwin32_native_compilation}" = yes; then
     with_native_compilation=yes
@@ -5197,7 +5230,8 @@ if test "$with_features" = "no" \
   with_native_compilation=no
 fi
 
-if test "${with_native_compilation}" = "default"; then
+if test "${with_native_compilation}" = "default" \
+   && test "$native_comp_backend_resolved" != "comphack"; then
     # Check if libgccjit is available.
     AC_CHECK_LIB([gccjit], [gcc_jit_context_acquire],
       [], [libgccjit_not_found])
@@ -5212,13 +5246,22 @@ if test "${with_native_compilation}" = "default"; then
 fi
 
 if test "${with_native_compilation}" != "no"; then
-    if test "$with_unexec" = yes; then
-       AC_MSG_ERROR(['--with-native-compilation' is not compatible with unexec])
-    fi
-    if test "${HAVE_ZLIB}" = no; then
-       AC_MSG_ERROR(['--with-native-compilation' requires zlib])
-    fi
+  if test "$with_unexec" = yes; then
+     AC_MSG_ERROR(['--with-native-compilation' is not compatible with unexec])
+  fi
+  if test "${HAVE_ZLIB}" = no; then
+     AC_MSG_ERROR(['--with-native-compilation' requires zlib])
+  fi
 
+  if test "$native_comp_backend_resolved" = "comphack"; then
+    HAVE_NATIVE_COMP=yes
+    HAVE_NATIVE_COMP_COMPHACK=yes
+    NEED_DYNLIB=yes
+    AC_DEFINE([HAVE_NATIVE_COMP], [1],
+      [Define to 1 if native compiler is available.])
+    AC_DEFINE([HAVE_NATIVE_COMP_COMPHACK], [1],
+      [Define to 1 if the comphack native compiler backend is enabled.])
+  else
     SAVE_CFLAGS=$CFLAGS
     SAVE_LIBS=$LIBS
 
@@ -5268,6 +5311,7 @@ if test "${with_native_compilation}" != "no"; then
       AC_RUN_IFELSE([libgccjit_smoke_test], [], [libgccjit_broken_err])
     fi
     HAVE_NATIVE_COMP=yes
+    HAVE_NATIVE_COMP_GCCJIT=yes
     case "${opsys}" in
       # mingw32 loads the library dynamically.
       mingw32) ;;
@@ -5284,13 +5328,30 @@ if test "${with_native_compilation}" != "no"; then
     NEED_DYNLIB=yes
     AC_DEFINE([HAVE_NATIVE_COMP], [1],
       [Define to 1 if native compiler is available.])
+    AC_DEFINE([HAVE_NATIVE_COMP_GCCJIT], [1],
+      [Define to 1 if the libgccjit native compiler backend is available.])
 
     CFLAGS=$SAVE_CFLAGS
     LIBS=$SAVE_LIBS
+  fi
 fi
 AC_DEFINE_UNQUOTED([NATIVE_ELISP_SUFFIX], [".eln"],
   [System extension for native compiled elisp])
+if test "${with_native_compilation}" = "no"; then
+  native_comp_backend_define=none
+else
+  native_comp_backend_define=$native_comp_backend_resolved
+fi
+AC_DEFINE_UNQUOTED([NATIVE_COMP_DEFAULT_BACKEND], ["$native_comp_backend_define"],
+  [Default native compilation backend selected at configure time.])
+AC_DEFINE_UNQUOTED([COMPHACK_DEFAULT_CC], ["$comphack_cc"],
+  [Default compiler executable for the comphack backend.])
+AC_DEFINE_UNQUOTED([COMPHACK_DEFAULT_CC_FLAGS], ["$comphack_cc_flags"],
+  [Default compiler flags for the comphack backend.])
+AC_SUBST([NATIVE_COMP_DEFAULT_BACKEND], [$native_comp_backend_define])
 AC_SUBST([HAVE_NATIVE_COMP])
+AC_SUBST([HAVE_NATIVE_COMP_GCCJIT])
+AC_SUBST([HAVE_NATIVE_COMP_COMPHACK])
 AC_SUBST([LIBGCCJIT_CFLAGS])
 AC_SUBST([LIBGCCJIT_LIBS])
 
