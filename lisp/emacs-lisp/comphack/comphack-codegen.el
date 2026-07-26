@@ -632,8 +632,11 @@ If DST is non-nil, assigns result to DST."
                    (compc-mvar-to-c test)
                    true-bb
                    false-bb)
-         ;; Comparing to non-nil value: need explicit comparison
-         (format "if (%s == %s)\n  goto %s;\nelse\n  goto %s;"
+         ;; `cond-jump' has Lisp `eq' semantics.  In particular, Emacs 31
+         ;; considers a symbol-with-position equal to its bare symbol when
+         ;; `symbols_with_pos_enabled' is set.  Raw Lisp_Object comparison
+         ;; would make compiler dispatch on positioned source forms miss.
+         (format "if (fn->f_eq (%s, %s))\n  goto %s;\nelse\n  goto %s;"
                  (compc-mvar-to-c test)
                  (compc-immediate-to-c cmp-val)
                  true-bb
