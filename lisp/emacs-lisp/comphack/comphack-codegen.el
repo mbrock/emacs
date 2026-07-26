@@ -56,6 +56,82 @@
 (defvar compc--runtime-helper-name-cache nil
   "Cached list of helper names as strings.")
 
+(defvar compc--subr-arity-cache nil
+  "Map primitive names to the arities represented by the freloc table.")
+
+(defvar compc--c-name-map nil
+  "Map original anonymous C names to compilation-unit-local names.")
+
+(defun compc--mapped-c-name (name)
+  "Return compilation-unit-local C name corresponding to NAME."
+  (let ((name (cond
+               ((stringp name) name)
+               ((symbolp name) (symbol-name name))
+               (t (format "%s" name)))))
+    (or (and compc--c-name-map (gethash name compc--c-name-map))
+        name)))
+
+(defun compc--make-c-name-map (functions)
+  "Build content-addressed anonymous C symbol map for FUNCTIONS.
+TCC does not reliably keep identically named dynamic symbols local even when
+linking with -Bsymbolic.  Anonymous functions occur in many separate ELNs, so
+give differing functions differing names while preserving reproducible builds."
+  (let ((map (make-hash-table :test #'equal)))
+    (dolist (func functions map)
+      (let ((name (plist-get func :c-name)))
+        (when (and (stringp name)
+                   (string-match-p "_anonymous_lambda_" name))
+          (let ((function-c
+                 (with-temp-buffer
+                   (let ((compc--c-name-map nil)
+                         (buffer-undo-list t)
+                         (inhibit-modification-hooks t))
+                     (compc-insert-func func))
+                   (buffer-string))))
+            (puthash name
+                     (concat name "_u"
+                             (substring (secure-hash 'sha1 function-c) 0 12))
+                     map)))))))
+
+(defun compc--replace-c-names (obj &optional seen)
+  "Copy OBJ, replacing strings found in `compc--c-name-map'.
+Preserve sharing and circular structure using SEEN."
+  (let ((seen (or seen (make-hash-table :test #'eq))))
+    (cond
+     ((stringp obj) (compc--mapped-c-name obj))
+     ((vectorp obj)
+      (or (gethash obj seen)
+          (let ((copy (make-vector (length obj) nil)))
+            (puthash obj copy seen)
+            (dotimes (i (length obj))
+              (aset copy i (compc--replace-c-names (aref obj i) seen)))
+            copy)))
+     ((consp obj)
+      (or (gethash obj seen)
+          (let ((copy (cons nil nil)))
+            (puthash obj copy seen)
+            (setcar copy (compc--replace-c-names (car obj) seen))
+            (setcdr copy (compc--replace-c-names (cdr obj) seen))
+            copy)))
+     (t obj))))
+
+(defun compc--tree-memq (needle tree &optional seen)
+  "Return non-nil when NEEDLE occurs in TREE, tolerating circular structure."
+  (let ((seen (or seen (make-hash-table :test #'eq))))
+    (cond
+     ((eq needle tree) t)
+     ((or (consp tree) (vectorp tree))
+      (unless (gethash tree seen)
+        (puthash tree t seen)
+        (if (consp tree)
+            (or (compc--tree-memq needle (car tree) seen)
+                (compc--tree-memq needle (cdr tree) seen))
+          (catch 'found
+            (dotimes (i (length tree))
+              (when (compc--tree-memq needle (aref tree i) seen)
+                (throw 'found t)))))))
+     (t nil))))
+
 (defun compc--runtime-helper-symbols ()
   "Return helper symbols as provided by the runtime."
   (or compc--runtime-helper-symbols-cache
@@ -159,16 +235,18 @@ Bound dynamically during code generation.")
 (defun compc-immediate-to-c (val)
   "Convert immediate VAL (literal/closure template) to C code.
 Uses d_reloc when the value lives in the default data vector."
-  (pcase val
-    (`nil "Qnil")
-    (`t "Qt")
+  (cond
+    ((null val) "Qnil")
+    ((eq val t) "Qt")
     ;; Direct call to create a closure: (direct-call "C-name" arg1 arg2 ...)
-    (`(direct-call ,c-name . ,args)
-     (if args
-         (let ((args-str (mapconcat #'compc-mvar-to-c args ", ")))
-           (format "%s (%s)" c-name args-str))
-       (format "%s ()" c-name)))
-    (_
+    ((and (consp val) (eq (car val) 'direct-call))
+     (let ((c-name (compc--mapped-c-name (cadr val)))
+           (args (cddr val)))
+       (if args
+           (let ((args-str (mapconcat #'compc-mvar-to-c args ", ")))
+             (format "%s (%s)" c-name args-str))
+         (format "%s ()" c-name))))
+    (t
      ;; Recursively strip position info before lookup
      (let* ((bare-val (comphack--strip-positions val))
             (idx (and compc--d-default-idx
@@ -265,6 +343,7 @@ the call for its side effects."
                      ((symbolp func) (symbol-name func))
                      (t (format "%s" func))))
          (nargs (length args))
+         (func-name (compc--mapped-c-name func-name))
          (call-line (if dst
                         (format "%s = %s (%d, _args);"
                                 dst func-name nargs)
@@ -375,11 +454,13 @@ stringified destination or nil.  Returns a C snippet string or nil."
 (defun compc-get-subr-arity (func-name)
   "Get arity of built-in function FUNC-NAME.
 Returns cons (min . max) or nil if not found."
-  (condition-case nil
-      (let ((sym (intern func-name)))
-        (when (fboundp sym)
-          (subr-arity (symbol-function sym))))
-    (error nil)))
+  (unless compc--subr-arity-cache
+    (setq compc--subr-arity-cache (make-hash-table :test #'equal))
+    (dolist (subr comp-subr-list)
+      (puthash (subr-name subr)
+               (subr-arity subr)
+               compc--subr-arity-cache)))
+  (gethash func-name compc--subr-arity-cache))
 
 (defun compc--add-default-args (func-name args)
   "Add default arguments for functions that need them.
@@ -493,6 +574,10 @@ If DST is non-nil, assigns result to DST."
                 (fun-name (and (listp fun-name-arg)
                                (eq (car fun-name-arg) 'mvar)
                                (plist-get (cdr fun-name-arg) :val)))
+                (min-arg (nth 2 args))
+                (min-val (and (listp min-arg)
+                              (eq (car min-arg) 'mvar)
+                              (plist-get (cdr min-arg) :val)))
                 (max-arg (nth 3 args))
                 (max-val (and (listp max-arg)
                               (eq (car max-arg) 'mvar)
@@ -501,7 +586,7 @@ If DST is non-nil, assigns result to DST."
                 (needs-many (or (and fun-sym
                                      (gethash fun-sym compc--args-many-functions))
                                 (and (integerp max-val) (> max-val 8))))
-                (fixed-args (if needs-many
+                (fixed-args (if (and needs-many (not (consp min-val)))
                                 (let ((copy (copy-sequence args)))
                                   (setf (nth 3 copy) '(mvar :val nil))
                                   copy)
@@ -534,6 +619,10 @@ If DST is non-nil, assigns result to DST."
                 (fun-name (and (listp fun-name-arg)
                                (eq (car fun-name-arg) 'mvar)
                                (plist-get (cdr fun-name-arg) :val)))
+                (min-arg (nth 2 args))
+                (min-val (and (listp min-arg)
+                              (eq (car min-arg) 'mvar)
+                              (plist-get (cdr min-arg) :val)))
                 (max-arg (nth 3 args))
                 (max-val (and (listp max-arg)
                               (eq (car max-arg) 'mvar)
@@ -542,7 +631,7 @@ If DST is non-nil, assigns result to DST."
                 (needs-many (or (and fun-sym
                                      (gethash fun-sym compc--args-many-functions))
                                 (and (integerp max-val) (> max-val 8))))
-                (fixed-args (if needs-many
+                (fixed-args (if (and needs-many (not (consp min-val)))
                                 (let ((copy (copy-sequence args)))
                                   (setf (nth 3 copy) '(mvar :val nil))
                                   copy)
@@ -586,6 +675,10 @@ If DST is non-nil, assigns result to DST."
                 (fun-name (and (listp fun-name-arg)
                                (eq (car fun-name-arg) 'mvar)
                                (plist-get (cdr fun-name-arg) :val)))
+                (min-arg (nth 2 args))
+                (min-val (and (listp min-arg)
+                              (eq (car min-arg) 'mvar)
+                              (plist-get (cdr min-arg) :val)))
                 (max-arg (nth 3 args))
                 (max-val (and (listp max-arg)
                               (eq (car max-arg) 'mvar)
@@ -594,7 +687,7 @@ If DST is non-nil, assigns result to DST."
                 (needs-many (or (and fun-sym
                                      (gethash fun-sym compc--args-many-functions))
                                 (and (integerp max-val) (> max-val 8))))
-                (fixed-args (if needs-many
+                (fixed-args (if (and needs-many (not (consp min-val)))
                                 (let ((copy (copy-sequence args)))
                                   (setf (nth 3 copy) '(mvar :val nil))
                                   copy)
@@ -627,8 +720,8 @@ If DST is non-nil, assigns result to DST."
                       (plist-get (cdr cmp) :val))
                      (t cmp))))
        (if (null cmp-val)
-           ;; Comparing to nil: !test means test is nil/false
-           (format "if (!%s)\n  goto %s;\nelse\n  goto %s;"
+           ;; Comparing to nil requires Lisp_Object equality, not C truth.
+           (format "if (%s == Qnil)\n  goto %s;\nelse\n  goto %s;"
                    (compc-mvar-to-c test)
                    true-bb
                    false-bb)
@@ -715,10 +808,11 @@ If DST is non-nil, assigns result to DST."
 
     ;; Direct call without assignment - just call for side effects
     (`(direct-call ,c-name . ,args)
-     (if args
-         (let ((args-str (mapconcat #'compc-mvar-to-c args ", ")))
-           (format "%s (%s);" c-name args-str))
-       (format "%s ();" c-name)))
+     (let ((c-name (compc--mapped-c-name c-name)))
+       (if args
+           (let ((args-str (mapconcat #'compc-mvar-to-c args ", ")))
+             (format "%s (%s);" c-name args-str))
+         (format "%s ();" c-name))))
 
     (_ (error "Unknown instruction: %S" insn))))
 
@@ -741,8 +835,8 @@ If DST is non-nil, assigns result to DST."
                (args-clean (cond
                             ((comp-args-p args)
                              (list (aref args 1) (aref args 2)))
-                            ((listp args) args)
-                            (t '(0 0))))
+                            ((consp args) args)
+                            (t (list 0 0))))
                (min-args (car args-clean))
                (max-args (cadr args-clean))
                (has-rest-args (or (memq max-args '(many unevalled))
@@ -813,6 +907,7 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
 (defun compc-insert-func (func)
   "Insert function FUNC using c-mode commands."
   (pcase-let* (((map :c-name :frame-size :blocks) func)
+               (c-name (compc--mapped-c-name c-name))
                (arity-info (compc--function-arity-info func))
                (lisp-name (plist-get arity-info :lisp-name))
                (min-args (plist-get arity-info :min))
@@ -851,7 +946,7 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
                            (lambda (block)
                              (cl-some (lambda (insn)
                                         (and (listp insn)
-                                             (memq 'scratch (flatten-tree insn))))
+                                             (compc--tree-memq 'scratch insn)))
                                       (plist-get block :insns)))
                            blocks)))
         (when uses-scratch
@@ -914,17 +1009,7 @@ in TCC."
 
 (defun compc--make-data-readable (obj)
   "Make OBJ readable by converting symbols-with-pos to plain symbols."
-  (cond
-   ((symbol-with-pos-p obj)
-    (bare-symbol obj))
-   ((symbolp obj)
-    obj)
-   ((vectorp obj)
-    (vconcat (mapcar #'compc--make-data-readable obj)))
-   ((consp obj)
-    (cons (compc--make-data-readable (car obj))
-          (compc--make-data-readable (cdr obj))))
-   (t obj)))
+  (compc--replace-c-names (comphack--strip-positions obj)))
 
 (defun compc-insert-blob (name obj)
   "Insert static blob declaration for NAME containing OBJ."
@@ -932,6 +1017,7 @@ in TCC."
          (serialized (let ((print-length nil)
                            (print-level nil)
                            (print-circle t)
+                           (print-gensym t)
                            (print-escape-newlines t)
                            (print-escape-multibyte t))
                        (prin1-to-string readable-obj)))
@@ -995,6 +1081,7 @@ Uses c-mode for proper GNU C coding style indentation."
     (let ((compc--d-default-idx d-default-idx)
           (compc--d-impure-idx d-impure-idx)
           (compc--d-ephemeral-idx d-ephemeral-idx)
+          (compc--c-name-map nil)
           (compc--args-many-functions (make-hash-table :test 'eq))
           (buffer-undo-list t)
           (inhibit-modification-hooks t))
@@ -1008,6 +1095,8 @@ Uses c-mode for proper GNU C coding style indentation."
                            (not rest))))
           (when (and sym (not fixed))
             (puthash sym t compc--args-many-functions))))
+      (setq compc--c-name-map
+            (compc--make-c-name-map functions))
      ; (c-mode)
       (font-lock-mode -1)
       (setq c-default-style "gnu")
@@ -1029,16 +1118,11 @@ Uses c-mode for proper GNU C coding style indentation."
         (when user-funcs
           (insert "\n")
           (dolist (func user-funcs)
-            (pcase-let* (((map :c-name :args) func)
-                         (args-clean (cond
-                                      ((comp-args-p args)
-                                       (list (aref args 1) (aref args 2)))
-                                      ((listp args) args)
-                                      (t '(0 0))))
-                         (min-args (car args-clean))
-                         (max-args (cadr args-clean))
-                         (has-rest-args (or (memq max-args '(many unevalled))
-                                            (compc-func-has-rest-args-p func)))
+            (pcase-let* (((map :c-name) func)
+                         (c-name (compc--mapped-c-name c-name))
+                         (info (compc--function-arity-info func))
+                         (max-args (plist-get info :max))
+                         (has-rest-args (plist-get info :rest))
                          (fixed-arity (and (numberp max-args)
                                            (<= max-args 8)
                                            (not has-rest-args)))
@@ -1320,7 +1404,7 @@ Returns the filename of the freloc header (e.g., \"generated/freloc-2b8d5670.h\"
       (insert (format "\n#endif /* %s */\n" guard-name)))
 
     (rename-file tmp-file freloc-file t)
-    (message "Generated %s" (concat "generated/" freloc-filename))
+    (comp-log (format "Generated %s" (concat "generated/" freloc-filename)))
     (concat "generated/" freloc-filename)))
 
 (provide 'comphack-codegen)

@@ -36,7 +36,7 @@
       "unknown"))
 
 (defvar comphack-compiler-flags
-  '("-shared" "-fPIC" "-O0" "-g" "-w"
+  '("-shared" "-fPIC" "-O0" "-w"
     "-fno-stack-protector" "-fno-toplevel-reorder")
   "Flags passed to the compiler when compiling C to .eln.
 The -fno-toplevel-reorder flag is critical to preserve blob declaration order.")
@@ -148,18 +148,54 @@ Returns either a slot number, a constant value wrapper, or a plist representatio
     (mapcar #'comphack--clean-insn insn))
    (t insn)))
 
-(defun comphack--strip-positions (obj)
-  "Strip position info from OBJ recursively.
-Handles symbols-with-pos, vectors, and conses. This is used for hash table keys."
+(defun comphack--contains-positioned-symbol-p (obj &optional seen)
+  "Return non-nil if OBJ contains a symbol-with-position."
+  (let ((seen (or seen (make-hash-table :test #'eq))))
+    (cond
+     ((symbol-with-pos-p obj) t)
+     ((or (consp obj) (vectorp obj))
+      (unless (gethash obj seen)
+        (puthash obj t seen)
+        (if (consp obj)
+            (or (comphack--contains-positioned-symbol-p (car obj) seen)
+                (comphack--contains-positioned-symbol-p (cdr obj) seen))
+          (catch 'found
+            (dotimes (i (length obj))
+              (when (comphack--contains-positioned-symbol-p
+                     (aref obj i) seen)
+                (throw 'found t)))))))
+     (t nil))))
+
+(defun comphack--copy-without-positions (obj seen)
+  "Copy OBJ into graph SEEN while stripping symbol positions."
   (cond
    ((symbol-with-pos-p obj)
     (bare-symbol obj))
    ((vectorp obj)
-    (vconcat (mapcar #'comphack--strip-positions obj)))
+    (or (gethash obj seen)
+        (let ((copy (make-vector (length obj) nil)))
+          (puthash obj copy seen)
+          (dotimes (i (length obj))
+            (aset copy i (comphack--copy-without-positions
+                          (aref obj i) seen)))
+          copy)))
    ((consp obj)
-    (cons (comphack--strip-positions (car obj))
-          (comphack--strip-positions (cdr obj))))
+    (or (gethash obj seen)
+        (let ((copy (cons nil nil)))
+          (puthash obj copy seen)
+          (setcar copy (comphack--copy-without-positions (car obj) seen))
+          (setcdr copy (comphack--copy-without-positions (cdr obj) seen))
+          copy)))
    (t obj)))
+
+(defun comphack--strip-positions (obj)
+  "Strip position info from OBJ recursively.
+Handles symbols-with-pos, vectors, conses, sharing, and circular structure.
+Objects without positioned symbols retain their identity."
+  (if (comphack--contains-positioned-symbol-p obj)
+      (comphack--copy-without-positions
+       obj (make-hash-table :test #'eq))
+    obj))
 
 (defun comphack--extract-data-container (container)
   "Extract serialized data from CONTAINER.
@@ -365,11 +401,13 @@ Signals error if compilation fails."
             (make-temp-file
              (expand-file-name ".comphack-" eln-directory) nil ".eln"))
            (all-flags (append comphack-compiler-flags
+                              (when (> native-comp-debug 0) '("-g"))
                               comphack-linker-flags
                               native-comp-comphack-extra-flags
                               include-flags
                               (list "-o" temporary-eln c-file))))
-      (message "Compiling C → ELN: %s" (file-name-nondirectory eln-file))
+      (comp-log
+       (format "Compiling C → ELN: %s" (file-name-nondirectory eln-file)))
       (unwind-protect
           (with-temp-buffer
             (let ((exit-code
@@ -383,9 +421,10 @@ Signals error if compilation fails."
             ;; Publish only complete shared objects.  Native compilation can
             ;; have consumers waiting for this exact file in other processes.
             (rename-file temporary-eln eln-file t)
-            (message "Successfully compiled %s (%d bytes)"
+            (comp-log
+             (format "Successfully compiled %s (%d bytes)"
                      eln-file
-                     (file-attribute-size (file-attributes eln-file))))
+                     (file-attribute-size (file-attributes eln-file)))))
         (when (file-exists-p temporary-eln)
           (ignore-errors (delete-file temporary-eln)))))))
 
