@@ -28,7 +28,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 #include <libgccjit.h>
+#endif
 #include <epaths.h>
 
 #include "puresize.h"
@@ -466,6 +468,13 @@ load_gccjit_if_necessary (bool mandatory)
   return true;
 #endif
 }
+#else /* !HAVE_NATIVE_COMP_GCCJIT */
+static bool
+load_gccjit_if_necessary (bool mandatory)
+{
+  return false;
+}
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 
 /* Increase this number to force a new Vcomp_abi_hash to be generated.  */
@@ -560,6 +569,7 @@ static f_reloc_t freloc;
 # define NUM_CAST_TYPES 15
 #endif
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 typedef struct {
   EMACS_INT len;
   gcc_jit_rvalue *r_val;
@@ -688,6 +698,7 @@ typedef struct {
 } comp_t;
 
 static comp_t comp;
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 static FILE *logfile;
 
@@ -697,10 +708,12 @@ typedef struct {
   char data[];
 } static_obj_t;
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 typedef struct {
   reloc_array_t array;
   gcc_jit_rvalue *idx;
 } imm_reloc_t;
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 
 /*
@@ -909,6 +922,7 @@ bcall0 (Lisp_Object f)
   Ffuncall (1, &f);
 }
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 static gcc_jit_block *
 retrieve_block (Lisp_Object block_name)
 {
@@ -4410,6 +4424,7 @@ compile_function (Lisp_Object func)
   SAFE_FREE ();
 }
 
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
 
 /**********************************/
 /* Entry points exposed to lisp.  */
@@ -4631,6 +4646,7 @@ DEFUN ("comp--install-trampoline", Fcomp__install_trampoline,
     return Qnil;
 }
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
 DEFUN ("comp--init-ctxt", Fcomp__init_ctxt, Scomp__init_ctxt,
        0, 0, 0,
        doc: /* Initialize the native compiler context.
@@ -5081,6 +5097,8 @@ unknown (before GCC version 10).  */)
 }
 #pragma GCC diagnostic pop
 
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
+
 
 /******************************************************************************/
 /* Helper functions called from the run-time.				      */
@@ -5185,6 +5203,7 @@ eln_load_path_final_clean_up (void)
 
 /* This function puts the compilation unit in the
   `Vcomp_loaded_comp_units_h` hashmap.  */
+
 static void
 register_native_comp_unit (Lisp_Object comp_u)
 {
@@ -5524,6 +5543,7 @@ native_function_doc (Lisp_Object function)
   return AREF (cu->data_fdoc_v, XSUBR (function)->doc);
 }
 
+
 static Lisp_Object
 make_subr (Lisp_Object symbol_name, Lisp_Object minarg, Lisp_Object maxarg,
 	   Lisp_Object c_name, Lisp_Object type, Lisp_Object doc_idx,
@@ -5570,7 +5590,6 @@ make_subr (Lisp_Object symbol_name, Lisp_Object minarg, Lisp_Object maxarg,
 #endif
   Lisp_Object tem;
   XSETSUBR (tem, &x->s);
-
   return tem;
 }
 
@@ -5701,7 +5720,6 @@ LATE-LOAD has to be non-nil when loading for deferred compilation.  */)
   return load_comp_unit (comp_u, false, !NILP (late_load));
 }
 
-#endif /* HAVE_NATIVE_COMP */
 
 DEFUN ("native-comp-available-p", Fnative_comp_available_p,
        Snative_comp_available_p, 0, 0, 0,
@@ -5914,13 +5932,16 @@ natively-compiled one.  */);
   defsubr (&Scomp__subr_signature);
   defsubr (&Scomp_el_to_eln_rel_filename);
   defsubr (&Scomp_el_to_eln_filename);
+#ifdef HAVE_NATIVE_COMP_GCCJIT
   defsubr (&Scomp_native_driver_options_effective_p);
   defsubr (&Scomp_native_compiler_options_effective_p);
-  defsubr (&Scomp__install_trampoline);
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
+#ifdef HAVE_NATIVE_COMP_GCCJIT
   defsubr (&Scomp__init_ctxt);
   defsubr (&Scomp__release_ctxt);
   defsubr (&Scomp__compile_ctxt_to_file0);
   defsubr (&Scomp_libgccjit_version);
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
   defsubr (&Scomp__register_lambda);
   defsubr (&Scomp__register_subr);
   defsubr (&Scomp__late_register_subr);
@@ -5929,6 +5950,7 @@ natively-compiled one.  */);
   defsubr (&Scomp__header_constants);
   defsubr (&Snative_elisp_load);
 
+#ifdef HAVE_NATIVE_COMP_GCCJIT
   staticpro (&comp.exported_funcs_h);
   comp.exported_funcs_h = Qnil;
   staticpro (&comp.imported_funcs_h);
@@ -5936,6 +5958,7 @@ natively-compiled one.  */);
   staticpro (&comp.func_blocks_h);
   staticpro (&comp.emitter_dispatcher);
   comp.emitter_dispatcher = Qnil;
+#endif /* HAVE_NATIVE_COMP_GCCJIT */
   staticpro (&loadsearch_re_list);
   loadsearch_re_list = Qnil;
 

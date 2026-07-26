@@ -88,22 +88,17 @@ Uses Emacs's native-compile in dry-run mode to capture the IR."
 
 (defconst comphack--type-hint-symbols '(fixnum cons)
   "Type hints accepted by `comp-mvar-type-hint-match-p'.
-Composite hints such as `integer' and `number' are inferred from these or
-from literal values.")
+These are the only type hints that comp.c understands.")
 
 (defun comphack--collect-type-hints (mvar)
-  "Return list of type symbols proven for MVAR."
+  "Return list of type symbols proven for MVAR.
+Only returns type hints that comp.c actually understands (fixnum, cons)."
   (when (and (comp-mvar-p mvar)
              (fboundp 'comp-mvar-type-hint-match-p))
     (let (hints)
       (dolist (sym comphack--type-hint-symbols)
         (when (comp-mvar-type-hint-match-p mvar sym)
           (cl-pushnew sym hints)))
-      (when (memq 'fixnum hints)
-        (cl-pushnew 'integer hints)
-        (cl-pushnew 'number hints))
-      (when (memq 'integer hints)
-        (cl-pushnew 'number hints))
       hints)))
 
 (defun comphack--clean-insn (insn)

@@ -162,8 +162,6 @@ Uses d_reloc when the value lives in the default data vector."
   (pcase val
     (`nil "Qnil")
     (`t "Qt")
-    ((pred integerp)
-     (format "make_fixnum (%d)" val))
     ;; Direct call to create a closure: (direct-call "C-name" arg1 arg2 ...)
     (`(direct-call ,c-name . ,args)
      (if args
@@ -176,6 +174,8 @@ Uses d_reloc when the value lives in the default data vector."
             (idx (and compc--d-default-idx
                       (gethash bare-val compc--d-default-idx))))
        (cond
+        ;; Check reloc tables first (even for integers!)
+        ;; This is crucial for closures where integers may be indices
         (idx
          (format "RELOC (%d)" idx))
         ((and compc--d-impure-idx
@@ -184,6 +184,9 @@ Uses d_reloc when the value lives in the default data vector."
         ((and compc--d-ephemeral-idx
               (setq idx (gethash bare-val compc--d-ephemeral-idx)))
          (format "RELOC_EPH (%d)" idx))
+        ;; Only treat as literal integer if not found in reloc tables
+        ((integerp bare-val)
+         (format "make_fixnum (%d)" bare-val))
         ;; For plain symbols not in any reloc array, intern them
         ((symbolp bare-val)
          (format "intern_c_string (\"%s\")" (symbol-name bare-val)))
@@ -218,11 +221,10 @@ Uses d_reloc when the value lives in the default data vector."
     (_ (compc-immediate-to-c mvar))))
 
 (defun compc--infer-type-hints-from-value (val)
-  "Return list of type symbols implied by literal VAL."
+  "Return list of type symbols implied by literal VAL.
+Only returns types that match comp.c's type hint system (fixnum, cons)."
   (cond
-   ((fixnump val) '(fixnum integer number))
-   ((integerp val) '(integer number))
-   ((floatp val) '(number))
+   ((fixnump val) '(fixnum))
    ((consp val) '(cons))
    (t nil)))
 
@@ -348,12 +350,14 @@ stringified destination or nil.  Returns a C snippet string or nil."
              (assign "Qt")
            (inline-boolean (format "CONSP (%s)" arg1-c))))
         ("numberp"
-         (if (compc--mvar-has-any-type arg1 '(number integer fixnum))
+         ;; If known to be fixnum, it's definitely a number
+         (if (compc--mvar-has-type arg1 'fixnum)
              (assign "Qt")
            (inline-boolean
             (format "FIXNUMP (%1$s) || BIGNUMP (%1$s) || FLOATP (%1$s)" arg1-c))))
         ("integerp"
-         (if (compc--mvar-has-any-type arg1 '(integer fixnum))
+         ;; If known to be fixnum, it's definitely an integer
+         (if (compc--mvar-has-type arg1 'fixnum)
              (assign "Qt")
            (inline-boolean
             (format "FIXNUMP (%1$s) || BIGNUMP (%1$s)" arg1-c))))
