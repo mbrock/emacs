@@ -892,16 +892,22 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
 ;;; Data Serialization
 
 (defun compc-escape-c-string (str)
-  "Escape STR for use in C string literal."
-  (with-temp-buffer
-    (insert str)
-    (goto-char (point-min))
-    (while (re-search-forward "[\"\\]" nil t)
-      (replace-match "\\\\\\&" nil nil))
-    (goto-char (point-min))
-    (while (re-search-forward "\n" nil t)
-      (replace-match "\\\\n" nil nil))
-    (buffer-string)))
+  "Escape STR as a portable C string literal payload.
+Encode non-ASCII and control characters as fixed-width octal escapes so the
+generated C source itself contains no embedded control bytes.  In particular,
+literal NUL bytes are accepted by GCC but prematurely terminate a string token
+in TCC."
+  (let ((bytes (encode-coding-string str 'utf-8 t)))
+    (with-temp-buffer
+      (dotimes (i (length bytes))
+        (let ((byte (aref bytes i)))
+          (cond
+           ((eq byte ?\") (insert "\\\""))
+           ((eq byte ?\\) (insert "\\\\"))
+           ((eq byte ?\n) (insert "\\n"))
+           ((and (>= byte #x20) (<= byte #x7e)) (insert byte))
+           (t (insert (format "\\%03o" byte))))))
+      (buffer-string))))
 
 (defun compc--make-data-readable (obj)
   "Make OBJ readable by converting symbols-with-pos to plain symbols."

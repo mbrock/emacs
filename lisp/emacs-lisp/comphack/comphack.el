@@ -41,6 +41,15 @@
   "Flags passed to the compiler when compiling C to .eln.
 The -fno-toplevel-reorder flag is critical to preserve blob declaration order.")
 
+(defvar comphack-linker-flags
+  (when (memq system-type '(gnu gnu/linux gnu/kfreebsd berkeley-unix usg-unix-v))
+    '("-Wl,-Bsymbolic"))
+  "Platform linker flags used to bind references within each .eln.
+Comphack's exported function and data names are intentionally discoverable by
+the Emacs loader, but many recur in different compilation units.  ELF's normal
+symbol interposition would otherwise let one loaded .eln capture another
+.eln's internal references.")
+
 (defvar comphack-base-dir
   (file-name-directory (or load-file-name buffer-file-name))
   "Base directory of comphack installation.")
@@ -343,29 +352,42 @@ When KEEP-C-SOURCE is non-nil, preserve the intermediate C translation."
         (ignore-errors (delete-file tmp-c-file))))))
 
 (defun comphack--compile-c-to-eln (c-file eln-file)
-  "Compile C-FILE to ELN-FILE using GCC.
+  "Compile C-FILE to ELN-FILE using the configured C compiler.
 Signals error if compilation fails."
-  (let* ((include-flags
+  (let* ((eln-file (expand-file-name eln-file))
+         (eln-directory (file-name-directory eln-file))
+         (include-flags
           (list (concat "-I" comphack-emacs-source-dir)
                 (concat "-I" comphack-emacs-source-dir "/lib")
-                (concat "-I" comphack-base-dir)))
-         (all-flags (append comphack-compiler-flags
-                            native-comp-comphack-extra-flags
-                            include-flags
-                            (list "-o" eln-file c-file))))
-    (make-directory (file-name-directory eln-file) t)
-
-    (message "Compiling C → ELN: %s" (file-name-nondirectory eln-file))
-
-    (with-temp-buffer
-      (let ((exit-code (apply #'call-process native-comp-comphack-cc nil t nil all-flags)))
-        (if (zerop exit-code)
+                (concat "-I" comphack-base-dir))))
+    (make-directory eln-directory t)
+    (let* ((temporary-eln
+            (make-temp-file
+             (expand-file-name ".comphack-" eln-directory) nil ".eln"))
+           (all-flags (append comphack-compiler-flags
+                              comphack-linker-flags
+                              native-comp-comphack-extra-flags
+                              include-flags
+                              (list "-o" temporary-eln c-file))))
+      (message "Compiling C → ELN: %s" (file-name-nondirectory eln-file))
+      (unwind-protect
+          (with-temp-buffer
+            (let ((exit-code
+                   (apply #'call-process
+                          native-comp-comphack-cc nil t nil all-flags)))
+              (unless (zerop exit-code)
+                (error
+                 "Comphack backend compiler failed with exit code %d:\n%s"
+                 exit-code
+                 (buffer-string))))
+            ;; Publish only complete shared objects.  Native compilation can
+            ;; have consumers waiting for this exact file in other processes.
+            (rename-file temporary-eln eln-file t)
             (message "Successfully compiled %s (%d bytes)"
                      eln-file
-                     (file-attribute-size (file-attributes eln-file)))
-          (error "Comphack backend compiler failed with exit code %d:\n%s"
-                 exit-code
-                 (buffer-string)))))))
+                     (file-attribute-size (file-attributes eln-file))))
+        (when (file-exists-p temporary-eln)
+          (ignore-errors (delete-file temporary-eln)))))))
 
 
 ;;; Debugging Utilities
