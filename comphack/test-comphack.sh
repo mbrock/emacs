@@ -7,6 +7,7 @@ if [[ ${1-} == "" ]]; then
   echo "  OUTPUT_ELN Destination .eln (defaults to alongside INPUT_EL)." >&2
   echo "Environment variables:" >&2
   echo "  EMACS_BIN           Path to the Emacs binary (default: repo src/emacs)." >&2
+  echo "  COMPHACK_CC         C compiler command (for example: gcc or tcc)." >&2
   echo "  COMPHACK_SKIP_LOAD  If set to 1, skip loading the resulting .eln." >&2
   exit 1
 fi
@@ -38,7 +39,10 @@ mkdir -p -- "$(dirname -- "$OUTPUT_ELN")"
 COMPHACK_INPUT="$INPUT_EL" COMPHACK_OUTPUT="$OUTPUT_ELN" "$EMACS_BIN" -Q --batch \
   -l "$COMPHACK_LISP" \
   --eval '(let ((input (getenv "COMPHACK_INPUT"))
-                (output (getenv "COMPHACK_OUTPUT")))
+                (output (getenv "COMPHACK_OUTPUT"))
+                (cc (getenv "COMPHACK_CC")))
+            (when (and cc (not (equal cc "")))
+              (setq native-comp-comphack-cc cc))
             (comphack-compile-to-eln input output))'
 
 if [[ "${COMPHACK_SKIP_LOAD:-0}" != "1" ]]; then

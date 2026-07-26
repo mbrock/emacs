@@ -918,18 +918,17 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
    (t obj)))
 
 (defun compc-insert-blob (name obj)
-  "Insert static blob declaration for NAME containing OBJ.
-Uses C raw string literals (GCC extension with -std=gnu99) with
-unique delimiter to avoid conflicts."
+  "Insert static blob declaration for NAME containing OBJ."
   (let* ((readable-obj (compc--make-data-readable obj))
          (serialized (let ((print-length nil)
                            (print-level nil)
                            (print-circle t)
                            (print-escape-newlines t)
                            (print-escape-multibyte t))
-                       (prin1-to-string readable-obj))))
+                       (prin1-to-string readable-obj)))
+         (escaped (compc-escape-c-string serialized)))
     (insert "\n")
-    (compc-insert-line (format "DEFBLOB (%s,\n  R\"LISP(%s)LISP\");" name serialized))))
+    (compc-insert-line (format "DEFBLOB (%s,\n  \"%s\");" name escaped))))
 
 (defun compc-insert-data-blobs (minimal)
   "Insert data blob declarations from MINIMAL context."

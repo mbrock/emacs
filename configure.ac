@@ -1763,7 +1763,7 @@ AC_SUBST([NATIVE_COMP_BACKEND], [$native_comp_backend])
 comphack_cc=${CC}
 AC_ARG_WITH([comphack-cc],
   [AS_HELP_STRING([--with-comphack-cc=PROGRAM],
-                  [compiler command comphack should use when building .eln files.])],
+                  [compiler command comphack should use when building .eln files (for example, gcc or tcc).])],
   [if test "x$withval" != x; then
      comphack_cc=$withval
    fi])
