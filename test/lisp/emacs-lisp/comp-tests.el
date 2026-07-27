@@ -28,6 +28,9 @@
 (defvar comp-native-version-dir)
 (defvar native-comp-eln-load-path)
 
+(declare-function compc-insert-base-definitions "comphack-codegen")
+(declare-function comphack-codegen-write-shards "comphack-codegen")
+
 (defmacro with-test-native-compile-prune-cache (&rest body)
   (declare (indent 0) (debug t))
   `(ert-with-temp-directory testdir
@@ -139,6 +142,24 @@
         (should-not (string-match-p "DEFUN top_level_run" shards))
         (should (string-match-p "DEFUN Flarge" shards))
         (should (string-match-p "DEFUN Fsmall" shards))))))
+
+(ert-deftest comp-comphack-freloc-preserves-filc-capabilities ()
+  "The generated ABI header must keep Lisp objects pointer-typed in Fil-C."
+  (require 'comphack-codegen)
+  (let ((header
+         (with-temp-buffer
+           (compc-insert-base-definitions)
+           (buffer-string))))
+    (should
+     (string-match-p
+      (regexp-quote
+       "#ifdef __FILC__\nstruct Lisp_X;\ntypedef struct Lisp_X *Lisp_Object;")
+      header))
+    (should
+     (string-match-p
+      (regexp-quote
+       "#ifdef __FILC__\n    return (char *)obj - LISP_WORD_TAG")
+      header))))
 
 
 ;;; comp-tests.el ends here
