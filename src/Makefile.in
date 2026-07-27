@@ -943,7 +943,8 @@ tags: TAGS ../lisp/TAGS $(lwlibdir)/TAGS $(lib)/TAGS
 
 ifneq ($(XCONFIGURE),android)
 ifeq ($(NATIVE_COMP_ZYGOTE),yes)
-$(preloaded_zygote_stamp): $(preloaded_lisp_elc:.elc=.el) | \
+$(preloaded_zygote_stamp): $(preloaded_zygote_first:.elc=.el) \
+  $(preloaded_lisp_elc:.elc=.el) | \
   bootstrap-emacs$(EXEEXT) $(bootstrap_pdmp)
 	$(MAKE) -C ../lisp EMACS="$(bootstrap_exe)" \
 	  NATIVE_COMP_ZYGOTE_JOBS="$(NATIVE_COMP_ZYGOTE_JOBS)" \
@@ -955,7 +956,8 @@ $(preloaded_zygote_stamp): $(preloaded_lisp_elc:.elc=.el) | \
 	  compile-preloaded-zygote
 	$(AM_V_at)touch $@
 
-$(preloaded_lisp_elc): | $(preloaded_zygote_stamp)
+$(preloaded_zygote_first) $(preloaded_lisp_elc): | \
+  $(preloaded_zygote_stamp)
 	@test -f $@ || { \
 	  rm -f $(preloaded_zygote_stamp); \
 	  $(MAKE) $(preloaded_zygote_stamp); \
