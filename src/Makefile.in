@@ -593,6 +593,22 @@ shortlisp := loaddefs.el loadup.el $(sort ${shortlisp})
 export LISP_PRELOADED = ${shortlisp}
 lisp = $(addprefix ${lispsource}/,${shortlisp})
 
+# A Fil-C Emacs without a portable dump has a deliberately expensive
+# startup: it loads the preloaded Lisp from source.  Starting a fresh Emacs
+# for every preloaded .elc therefore dominates bootstrap time.  When
+# requested, compile those files in clean children forked from one warm
+# bootstrap Emacs.  Compile characters.el's generated prerequisites in a
+# first wave, as required by the ordinary dependency graph below.
+NATIVE_COMP_ZYGOTE = no
+NATIVE_COMP_ZYGOTE_JOBS = 12
+preloaded_lisp_elc = $(filter %.elc,$(lisp))
+preloaded_zygote_first = \
+  $(lispsource)/international/charscript.elc \
+  $(lispsource)/international/emoji-zwj.elc
+preloaded_zygote_rest = \
+  $(filter-out $(preloaded_zygote_first),$(preloaded_lisp_elc))
+preloaded_zygote_stamp = preloaded-lisp.zygote
+
 ## Construct full set of libraries to be linked.
 LIBES = $(LIBS) $(W32_LIBS) $(LIBS_GNUSTEP) $(PGTK_LIBS) $(LIBX_BASE) $(LIBIMAGE) \
    $(LIBX_OTHER) $(LIBSOUND) \
@@ -835,6 +851,7 @@ mostlyclean:
 	rm -f emacs.pdmp
 	rm -f ../etc/DOC
 	rm -f bootstrap-emacs$(EXEEXT) $(bootstrap_pdmp)
+	rm -f $(preloaded_zygote_stamp)
 	rm -f emacs-$(version)$(EXEEXT)
 	rm -f buildobj.h
 	rm -f globals.h gl-stamp
@@ -925,9 +942,30 @@ tags: TAGS ../lisp/TAGS $(lwlibdir)/TAGS $(lib)/TAGS
 ## been compiled by the top level `src' Makefile.
 
 ifneq ($(XCONFIGURE),android)
+ifeq ($(NATIVE_COMP_ZYGOTE),yes)
+$(preloaded_zygote_stamp): $(preloaded_lisp_elc:.elc=.el) | \
+  bootstrap-emacs$(EXEEXT) $(bootstrap_pdmp)
+	$(MAKE) -C ../lisp EMACS="$(bootstrap_exe)" \
+	  NATIVE_COMP_ZYGOTE_JOBS="$(NATIVE_COMP_ZYGOTE_JOBS)" \
+	  TARGETS="$(abspath $(preloaded_zygote_first:.elc=.el))" \
+	  compile-preloaded-zygote
+	$(MAKE) -C ../lisp EMACS="$(bootstrap_exe)" \
+	  NATIVE_COMP_ZYGOTE_JOBS="$(NATIVE_COMP_ZYGOTE_JOBS)" \
+	  TARGETS="$(abspath $(preloaded_zygote_rest:.elc=.el))" \
+	  compile-preloaded-zygote
+	$(AM_V_at)touch $@
+
+$(preloaded_lisp_elc): | $(preloaded_zygote_stamp)
+	@test -f $@ || { \
+	  rm -f $(preloaded_zygote_stamp); \
+	  $(MAKE) $(preloaded_zygote_stamp); \
+	  test -f $@; \
+	}
+else
 %.elc: %.el | bootstrap-emacs$(EXEEXT) $(bootstrap_pdmp)
 	@$(MAKE) $(AM_V_NO_PD) -C ../lisp EMACS="$(bootstrap_exe)"\
 		THEFILE=$< $<c
+endif
 endif
 
 ifeq ($(HAVE_NATIVE_COMP):$(NATIVE_DISABLED),yes:)
@@ -970,7 +1008,16 @@ elnlisp := $(addprefix ${lispsource}/,${elnlisp}) $(lisp:.elc=.eln)
 NATIVE_COMPILATION_AOT = @NATIVE_COMPILATION_AOT@
 ../native-lisp: | $(pdmp)
 	@if test ! -d $@; then \
-	  mkdir $@ && $(MAKE) $(AM_V_NO_PD) $(elnlisp); \
+	  mkdir $@ && \
+	  if test "$(NATIVE_COMP_ZYGOTE)" = yes; then \
+	    $(MAKE) $(AM_V_NO_PD) -C ../lisp \
+	      EMACS="../src/emacs$(EXEEXT)" \
+	      NATIVE_COMP_ZYGOTE_JOBS="$(NATIVE_COMP_ZYGOTE_JOBS)" \
+	      TARGETS="$(abspath $(patsubst %.eln,%.el,$(filter %.eln,$(elnlisp))))" \
+	      compile-native-zygote; \
+	  else \
+	    $(MAKE) $(AM_V_NO_PD) $(elnlisp); \
+	  fi; \
 	  if test $(SYSTEM_TYPE) = cygwin; then \
 	    find $@ -name '*.eln' | rebase -v -O -T -; \
 	  fi; \

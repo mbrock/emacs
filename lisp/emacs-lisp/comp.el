@@ -3736,16 +3736,15 @@ returned as (STATUS PID . FILE)."
         (when status
           (throw 'finished (cons status worker)))))))
 
-(defun batch-byte+native-compile-zygote ()
-  "Compile command-line files in clean children forked from this Emacs.
-
-The parent initializes the compiler once and never compiles a file itself.
-Each child begins with the same pristine compiler state, compiles exactly
-one source file as `batch-byte+native-compile' would, and exits.  The
-environment variable EMACS_ZYGOTE_JOBS controls the maximum number of
+(defun comp--batch-compile-zygote (compile-function)
+  "Compile command-line files in forked children using COMPILE-FUNCTION.
+COMPILE-FUNCTION receives one source filename.  The parent initializes the
+native compiler once and never compiles a file itself.  Each child begins
+with the same pristine compiler state and compiles exactly one source file.
+The environment variable EMACS_ZYGOTE_JOBS controls the maximum number of
 simultaneous children."
   (unless noninteractive
-    (error "`batch-byte+native-compile-zygote' is only for batch Emacs"))
+    (error "Compiler zygotes are only available in batch Emacs"))
   (unless (and (fboundp 'comp--zygote-fork)
                (fboundp 'comp--zygote-wait))
     (error "This Emacs does not support native compiler zygote workers"))
@@ -3761,8 +3760,7 @@ simultaneous children."
                (pid (comp--zygote-fork)))
           (if (zerop pid)
               (progn
-                (setq command-line-args-left (list file))
-                (batch-byte+native-compile)
+                (funcall compile-function file)
                 (kill-emacs 0))
             (push (cons pid file) workers))))
       (let ((finished (comp--zygote-finished-worker workers)))
@@ -3776,6 +3774,22 @@ simultaneous children."
       (message "Zygote worker failed for %s with status %d"
                (car failure) (cdr failure)))
     (kill-emacs (if failures 1 0))))
+
+(defun batch-byte+native-compile-zygote ()
+  "Compile command-line files in clean children forked from this Emacs.
+Each child compiles one source file as `batch-byte+native-compile' would."
+  (comp--batch-compile-zygote
+   (lambda (file)
+     (setq command-line-args-left (list file))
+     (batch-byte+native-compile))))
+
+(defun batch-native-compile-zygote ()
+  "Native-compile command-line files in clean forked children."
+  (byte-compile-refresh-preloaded)
+  (comp--batch-compile-zygote
+   (lambda (file)
+     (setq command-line-args-left (list file))
+     (batch-native-compile t))))
 
 (defun native-compile-prune-cache ()
   "Remove .eln files that aren't applicable to the current Emacs invocation."
