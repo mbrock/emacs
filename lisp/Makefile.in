@@ -65,6 +65,11 @@ BYTE_COMPILE_EXTRA_FLAGS =
 # BYTE_COMPILE_EXTRA_FLAGS = --eval '(setq byte-compile-warnings (quote (not unresolved)))'
 # The example above is just for developers, it should not be used by default.
 
+# Compile each Lisp file in a clean child forked from one initialized Emacs.
+# This is especially valuable for Fil-C builds without a portable dump.
+NATIVE_COMP_ZYGOTE = no
+NATIVE_COMP_ZYGOTE_JOBS = 12
+
 # All generated autoload files.
 loaddefs = $(shell find ${srcdir} -name '*loaddefs.el' ! -name '.*')
 # Elisp files auto-generated.
@@ -362,6 +367,24 @@ compile-targets: $(TARGETS)
 # loaddefs files.  But don't depend on it, because that might trigger
 # unnecessary rebuilds.
 compile-main: gen-lisp compile-clean main-first | autoloads
+ifeq ($(NATIVE_COMP_ZYGOTE),yes)
+	@(cd $(lisp) &&			     \
+	set --;				     \
+	els=`echo "${SUBDIRS_REL} " | sed -e 's|/\./|/|g' -e 's|/\. | |g' -e 's| |/*.el |g'`; \
+	for el in $$els; do		     \
+	  test -f $$el || continue;	     \
+	  test ! -f $${el}c &&		     \
+	      GREP_OPTIONS= grep '^;.*[^a-zA-Z]no-byte-compile: *t' $$el > /dev/null && \
+	      continue;			     \
+	  set -- "$$@" "$$el";		     \
+	done;				     \
+	if test "$$#" != 0; then		     \
+	  NATIVE_DISABLED="$(NATIVE_SKIP_NONDUMP)" \
+	  EMACS_ZYGOTE_JOBS="$(NATIVE_COMP_ZYGOTE_JOBS)" \
+	  $(emacs) $(BYTE_COMPILE_FLAGS) -l comp \
+	    -f batch-byte+native-compile-zygote "$$@"; \
+	fi)
+else
 	@(cd $(lisp) && 			     \
 	els=`echo "${SUBDIRS_REL} " | sed -e 's|/\./|/|g' -e 's|/\. | |g' -e 's| |/*.el |g'`; \
 	for el in $$els; do            \
@@ -376,6 +399,7 @@ compile-main: gen-lisp compile-clean main-first | autoloads
 		  NATIVE_DISABLED=$(NATIVE_SKIP_NONDUMP) \
 		  TARGETS="$$chunk";		     \
 	done
+endif
 
 # Compile some important files first.
 main-first:

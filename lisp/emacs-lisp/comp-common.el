@@ -129,6 +129,18 @@ Used to modify the compiler environment."
   :type '(repeat (string :tag "Flag"))
   :group 'comp-common)
 
+(defcustom native-comp-comphack-jobs
+  (if (and native-comp--configured-comphack-cc
+           (string-match-p "filc" native-comp--configured-comphack-cc))
+      (min 12 (num-processors))
+    1)
+  "Maximum concurrent C compiler processes used by the Comphack backend.
+A value greater than one enables size-balanced C translation-unit sharding.
+The default enables sharding automatically for a configured Fil-C compiler,
+whose whole-module safety lowering benefits substantially from parallelism."
+  :type '(integer :match (lambda (_widget value) (> value 0)))
+  :group 'comp-common)
+
 (defconst comp-primitive-type-specifiers
   `(
     ;; Functions we can trust not to be redefined, or, if redefined,

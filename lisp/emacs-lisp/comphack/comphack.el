@@ -391,22 +391,15 @@ Returns OUTPUT-FILE on success."
 If OUTPUT-FILE is nil, uses INPUT-FILE base name with .eln extension.
 Returns OUTPUT-FILE on success."
   (interactive "fInput .el file: ")
-
   (let* ((base (file-name-sans-extension input-file))
-         (c-file (make-temp-file "comphack-" nil ".c"))
-         (output-file (or output-file (concat base ".eln"))))
-
-    (unwind-protect
-        (progn
-          ;; Step 1: Elisp → C
-          (comphack-compile-to-c input-file c-file)
-
-          ;; Step 2: C → .eln
-          (comphack--compile-c-to-eln c-file output-file)
-
-          output-file)
-      ;; Always clean up temporary C file
-      (ignore-errors (delete-file c-file)))))
+         (output-file (or output-file (concat base ".eln")))
+         (ctxt (comphack--extract-limple input-file))
+         (minimal (comphack--simplify-ctxt ctxt))
+         (freloc-filename (comphack-codegen-ensure-freloc-h)))
+    (setq comphack--last-minimal minimal)
+    (comphack--compile-minimal-to-eln
+     minimal freloc-filename output-file)
+    output-file))
 
 (defun comphack-compile-comp-ctxt (ctxt output-file &optional keep-c-source)
   "Compile COMP-CTXT (a `comp-ctxt' struct) to OUTPUT-FILE using comphack.
@@ -414,31 +407,175 @@ When KEEP-C-SOURCE is non-nil, preserve the intermediate C translation."
   (unless output-file
     (error "Output file must be specified for comphack compilation"))
   (let* ((minimal (comphack--simplify-ctxt ctxt))
-         (freloc-filename (comphack-codegen-ensure-freloc-h))
-         (tmp-c-file (make-temp-file "emacs-comphack-" nil ".c")))
+         (freloc-filename (comphack-codegen-ensure-freloc-h)))
+    (comphack--compile-minimal-to-eln
+     minimal freloc-filename output-file keep-c-source)
+    output-file))
+
+(defun comphack--effective-compiler-flags ()
+  "Return C compiler flags suitable for the configured compiler."
+  ;; GCC's flag preserves blob order.  Clang preserves source order at -O0
+  ;; already and rejects this GCC-only spelling.
+  (if (string-match-p
+       "clang" (file-name-nondirectory native-comp-comphack-cc))
+      (delete "-fno-toplevel-reorder"
+              (copy-sequence comphack-compiler-flags))
+    comphack-compiler-flags))
+
+(defun comphack--include-flags (&optional shard-directory)
+  "Return Comphack include flags, including SHARD-DIRECTORY when non-nil."
+  (append
+   (when shard-directory
+     (list (concat "-I" shard-directory)))
+   (list (concat "-I" comphack-emacs-source-dir)
+         (concat "-I" comphack-emacs-source-dir "/lib")
+         (concat "-I" comphack-base-dir))))
+
+(defun comphack--compiler-error (exit-code output)
+  "Signal a compiler error for EXIT-CODE containing OUTPUT."
+  (error "Comphack backend compiler failed with exit code %d:\n%s"
+         exit-code output))
+
+(defun comphack--call-compiler (arguments)
+  "Run the configured C compiler with ARGUMENTS synchronously."
+  (with-temp-buffer
+    (let ((exit-code
+           (apply #'call-process
+                  native-comp-comphack-cc nil t nil arguments)))
+      (unless (zerop exit-code)
+        (comphack--compiler-error exit-code (buffer-string))))))
+
+(defun comphack--compile-sources-parallel (sources directory jobs)
+  "Compile C SOURCES into DIRECTORY using at most JOBS processes.
+Return the generated object filenames."
+  (let ((pending sources)
+        (running nil)
+        (objects nil)
+        (failures nil)
+        (compile-flags
+         (append
+          (delete "-shared"
+                  (copy-sequence (comphack--effective-compiler-flags)))
+          (when (> native-comp-debug 0) '("-g"))
+          native-comp-comphack-extra-flags
+          (comphack--include-flags directory)
+          '("-c"))))
     (unwind-protect
         (progn
-          (with-temp-file tmp-c-file
-            (comphack-codegen-insert-complete-eln minimal freloc-filename))
-          (comphack--compile-c-to-eln tmp-c-file output-file)
-          output-file)
-      (unless keep-c-source
-        (ignore-errors (delete-file tmp-c-file))))))
+          (while (or pending running)
+            (while (and pending (< (length running) jobs))
+              (let* ((source (pop pending))
+                     (object
+                      (expand-file-name
+                       (concat (file-name-base source) ".o") directory))
+                     (buffer (generate-new-buffer " *comphack compiler*"))
+                     (command
+                      (append (list native-comp-comphack-cc)
+                              compile-flags
+                              (list "-o" object source)))
+                     (process
+                      (make-process
+                       :name (format "comphack-%s" (file-name-base source))
+                       :buffer buffer
+                       :command command
+                       :connection-type 'pipe
+                       :noquery t)))
+                (push object objects)
+                (push (list process buffer source) running)))
+            (accept-process-output nil 0.05)
+            (let (still-running)
+              (dolist (job running)
+                (pcase-let ((`(,process ,buffer ,source) job))
+                  (if (process-live-p process)
+                      (push job still-running)
+                    (unless (and (eq (process-status process) 'exit)
+                                 (zerop (process-exit-status process)))
+                      (push
+                       (format "%s:\n%s"
+                               source
+                               (with-current-buffer buffer (buffer-string)))
+                       failures))
+                    (kill-buffer buffer))))
+              (setq running (nreverse still-running))))
+          (when failures
+            (error "Comphack shard compilation failed:\n%s"
+                   (mapconcat #'identity (nreverse failures) "\n")))
+          (nreverse objects))
+      (dolist (job running)
+        (pcase-let ((`(,process ,buffer ,_) job))
+          (when (process-live-p process)
+            (delete-process process))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)))))))
+
+(defun comphack--link-objects-to-eln (objects eln-file)
+  "Link OBJECTS and atomically publish ELN-FILE."
+  (let* ((eln-file (expand-file-name eln-file))
+         (eln-directory (file-name-directory eln-file))
+         (temporary-eln
+          (progn
+            (make-directory eln-directory t)
+            (make-temp-file
+             (expand-file-name ".comphack-" eln-directory) nil ".eln")))
+         (arguments
+          (append '("-shared")
+                  (when (> native-comp-debug 0) '("-g"))
+                  comphack-linker-flags
+                  native-comp-comphack-extra-flags
+                  (list "-o" temporary-eln)
+                  objects)))
+    (unwind-protect
+        (progn
+          (comphack--call-compiler arguments)
+          (rename-file temporary-eln eln-file t)
+          (comp-log
+           (format "Successfully compiled %s (%d bytes)"
+                   eln-file
+                   (file-attribute-size (file-attributes eln-file)))))
+      (when (file-exists-p temporary-eln)
+        (ignore-errors (delete-file temporary-eln))))))
+
+(defun comphack--compile-minimal-to-eln
+    (minimal freloc-filename eln-file &optional keep-c-source)
+  "Compile MINIMAL to ELN-FILE using FRELOC-FILENAME.
+When KEEP-C-SOURCE is non-nil, preserve generated intermediate sources."
+  (let ((jobs (max 1 native-comp-comphack-jobs)))
+    (if (= jobs 1)
+        (let ((c-file (make-temp-file "emacs-comphack-" nil ".c")))
+          (unwind-protect
+              (progn
+                (with-temp-file c-file
+                  (comphack-codegen-insert-complete-eln
+                   minimal freloc-filename))
+                (comphack--compile-c-to-eln c-file eln-file))
+            (unless keep-c-source
+              (ignore-errors (delete-file c-file)))))
+      (let ((directory (make-temp-file "emacs-comphack-shards-" t)))
+        (unwind-protect
+            (let* ((sources
+                    (comphack-codegen-write-shards
+                     minimal directory jobs freloc-filename))
+                   (objects
+                    (comphack--compile-sources-parallel
+                     sources directory jobs)))
+              (comp-log
+               (format "Compiled %d C shards with -j%d"
+                       (1- (length sources)) jobs))
+              (comphack--link-objects-to-eln objects eln-file))
+          (unless keep-c-source
+            (ignore-errors (delete-directory directory t))))))))
 
 (defun comphack--compile-c-to-eln (c-file eln-file)
   "Compile C-FILE to ELN-FILE using the configured C compiler.
 Signals error if compilation fails."
   (let* ((eln-file (expand-file-name eln-file))
          (eln-directory (file-name-directory eln-file))
-         (include-flags
-          (list (concat "-I" comphack-emacs-source-dir)
-                (concat "-I" comphack-emacs-source-dir "/lib")
-                (concat "-I" comphack-base-dir))))
+         (include-flags (comphack--include-flags)))
     (make-directory eln-directory t)
     (let* ((temporary-eln
             (make-temp-file
              (expand-file-name ".comphack-" eln-directory) nil ".eln"))
-           (all-flags (append comphack-compiler-flags
+           (all-flags (append (comphack--effective-compiler-flags)
                               (comphack--compiler-specific-flags)
                               (when (> native-comp-debug 0) '("-g"))
                               comphack-linker-flags
@@ -448,15 +585,8 @@ Signals error if compilation fails."
       (comp-log
        (format "Compiling C → ELN: %s" (file-name-nondirectory eln-file)))
       (unwind-protect
-          (with-temp-buffer
-            (let ((exit-code
-                   (apply #'call-process
-                          native-comp-comphack-cc nil t nil all-flags)))
-              (unless (zerop exit-code)
-                (error
-                 "Comphack backend compiler failed with exit code %d:\n%s"
-                 exit-code
-                 (buffer-string))))
+          (progn
+            (comphack--call-compiler all-flags)
             ;; Publish only complete shared objects.  Native compilation can
             ;; have consumers waiting for this exact file in other processes.
             (rename-file temporary-eln eln-file t)

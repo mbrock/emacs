@@ -99,6 +99,54 @@ Check that the resulting binaries do not differ."
             (message "Comparing %s %s" comp1-eln comp2-eln)
             (should (= (call-process "cmp" nil nil nil comp1-eln comp2-eln) 0))))))))
 
+(ert-deftest comp-tests-ssa-rename-insn ()
+  "SSA renaming should replace mvars by direct frame-slot lookup."
+  (let* ((comp-func (make-comp-func :frame-size 3 :vframe-size 1))
+         (frame (comp--new-frame 3 1 t))
+         (old-neg (comp-vec-aref frame -1))
+         (old-0 (comp-vec-aref frame 0))
+         (old-1 (comp-vec-aref frame 1))
+         (old-2 (comp-vec-aref frame 2))
+         (lval (make--comp-mvar :slot 1))
+         (scratch (make--comp-mvar :slot 'scratch))
+         (insn (list 'set lval
+                     (list (make--comp-mvar :slot -1)
+                           (make--comp-mvar :slot 0)
+                           (make--comp-mvar :slot 1)
+                           (make--comp-mvar :slot 2)
+                           scratch))))
+    (comp--ssa-rename-insn insn frame)
+    (should (eq (nth 0 (nth 2 insn)) old-neg))
+    (should (eq (nth 1 (nth 2 insn)) old-0))
+    ;; Rewrite the RHS before installing the new slot-1 lvalue.
+    (should (eq (nth 2 (nth 2 insn)) old-1))
+    (should (eq (nth 3 (nth 2 insn)) old-2))
+    (should (eq (nth 4 (nth 2 insn)) scratch))
+    (should (eq (cadr insn) (comp-vec-aref frame 1)))
+    (should-not (eq (cadr insn) old-1))
+
+    (let ((phi '(phi 2)))
+      (comp--ssa-rename-insn phi frame)
+      (should (eq (cadr phi) (comp-vec-aref frame 2)))
+      (should-not (eq (cadr phi) old-2)))
+
+    (let ((before (mapcar (lambda (slot)
+                            (comp-vec-aref frame slot))
+                          '(-1 0 1 2))))
+      (comp--ssa-rename-insn '(fetch-handler) frame)
+      (cl-mapc (lambda (slot old)
+                 (should-not (eq (comp-vec-aref frame slot) old)))
+               '(-1 0 1 2) before))
+
+    ;; Large flat argument lists should not consume evaluator depth.
+    (let* ((old (comp-vec-aref frame 0))
+           (insn (cons 'use
+                       (mapcar (lambda (_) (make--comp-mvar :slot 0))
+                               (number-sequence 1 2000))))
+           (max-lisp-eval-depth 100))
+      (comp--ssa-rename-insn insn frame)
+      (should (cl-every (lambda (arg) (eq arg old)) (cdr insn))))))
+
 (comp-deftest provide ()
   "Testing top level provide."
   (should (featurep 'comp-test-funcs)))
