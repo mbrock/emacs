@@ -103,6 +103,7 @@ lib/unistd.h
 src/buildobj.h
 src/globals.h
 src/lisp.mk
+src/preloaded-lisp.zygote
 src/verbose.mk
 
 # Stuff built during cross compilation
