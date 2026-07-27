@@ -1084,6 +1084,165 @@ in TCC."
   (compc-insert-line "struct freloc_link_table *freloc_link_table;")
   (insert "\n"))
 
+(defun compc-insert-externs (minimal)
+  "Insert external declarations shared by shards for MINIMAL."
+  (pcase-let* (((map :d-default :d-impure :d-ephemeral) minimal)
+               (default-len (length d-default))
+               (impure-len (length d-impure))
+               (ephemeral-len (length d-ephemeral)))
+    (compc-insert-line
+     (format "extern Lisp_Object d_reloc[%d];" (max 1 default-len)))
+    (compc-insert-line
+     (format "extern Lisp_Object d_reloc_imp[%d];" (max 1 impure-len)))
+    (compc-insert-line
+     (format "extern Lisp_Object d_reloc_eph[%d];" (max 1 ephemeral-len)))
+    (insert "\n")
+    (compc-insert-line "extern Lisp_Object comp_unit;")
+    (compc-insert-line "extern void **current_thread_reloc;")
+    (compc-insert-line "extern bool **f_symbols_with_pos_enabled_reloc;")
+    (compc-insert-line "extern void **pure_reloc;")
+    (compc-insert-line
+     "extern struct freloc_link_table *freloc_link_table;")
+    (insert "\n")))
+
+(defun compc--make-args-many-table (functions)
+  "Return a table of FUNCTIONS using the ARGS_MANY calling convention."
+  (let ((table (make-hash-table :test 'eq)))
+    (dolist (func functions table)
+      (let* ((info (compc--function-arity-info func))
+             (sym (plist-get info :symbol))
+             (max-args (plist-get info :max))
+             (rest (plist-get info :rest))
+             (fixed (and (numberp max-args)
+                         (<= max-args 8)
+                         (not rest))))
+        (when (and sym (not fixed))
+          (puthash sym t table))))))
+
+(defun compc-insert-function-prototypes (functions)
+  "Insert C prototypes for FUNCTIONS."
+  (dolist (func functions)
+    (pcase-let* (((map :c-name) func)
+                 (c-name (compc--mapped-c-name c-name))
+                 (info (compc--function-arity-info func))
+                 (max-args (plist-get info :max))
+                 (has-rest-args (plist-get info :rest))
+                 (fixed-arity (and (numberp max-args)
+                                   (<= max-args 8)
+                                   (not has-rest-args)))
+                 (params
+                  (if fixed-arity
+                      (if (zerop max-args)
+                          "void"
+                        (let ((args-list
+                               (mapconcat
+                                (lambda (i)
+                                  (format "Lisp_Object arg%d" i))
+                                (number-sequence 0 (1- max-args))
+                                ", ")))
+                          (if (> (length args-list) 50)
+                              (mapconcat
+                               (lambda (i)
+                                 (format "Lisp_Object arg%d" i))
+                               (number-sequence 0 (1- max-args))
+                               ",\n    ")
+                            args-list)))
+                    "ptrdiff_t nargs, Lisp_Object *args")))
+      (compc-insert-line
+       (format "Lisp_Object %s (%s);" c-name params)))))
+
+(defun compc--function-source (func)
+  "Return the generated C definition for FUNC."
+  (with-temp-buffer
+    (let ((buffer-undo-list t)
+          (inhibit-modification-hooks t))
+      (compc-insert-func func)
+      (insert "\n")
+      (buffer-string))))
+
+(defun compc--top-level-run-p (func)
+  "Return non-nil when FUNC is the native loader entry point."
+  (string= (compc--mapped-c-name (plist-get func :c-name))
+           "top_level_run"))
+
+(defun compc--balance-function-sources (sources shard-count)
+  "Distribute function SOURCES by size among SHARD-COUNT shards."
+  (let ((bins (make-vector shard-count nil))
+        (sizes (make-vector shard-count 0)))
+    (dolist (source (sort sources
+                          (lambda (a b) (> (length a) (length b)))))
+      (let ((best 0))
+        (dotimes (i shard-count)
+          (when (< (aref sizes i) (aref sizes best))
+            (setq best i)))
+        (push source (aref bins best))
+        (aset sizes best (+ (aref sizes best) (length source)))))
+    (dotimes (i shard-count)
+      (aset bins i (nreverse (aref bins i))))
+    bins))
+
+(defun comphack-codegen-write-shards
+    (minimal directory shard-count &optional freloc-filename)
+  "Write MINIMAL as C shards beneath DIRECTORY.
+SHARD-COUNT controls the number of function translation units.
+FRELOC-FILENAME specifies the ABI-versioned freloc header.
+Return the generated C source filenames, with the data source first."
+  (pcase-let* (((map :functions
+                     :d-default-idx
+                     :d-impure-idx
+                     :d-ephemeral-idx) minimal)
+               (freloc-h (or freloc-filename "freloc.h"))
+               ;; Fil-C capabilities for a compilation unit's loader entry
+               ;; point are tied to the unit data.  Keep top_level_run in the
+               ;; data translation unit while the ordinary native functions
+               ;; are free to compile in parallel.
+               (entry-functions
+                (cl-remove-if-not #'compc--top-level-run-p functions))
+               (shard-functions
+                (cl-remove-if #'compc--top-level-run-p functions))
+               (shard-count
+                (max 1 (min shard-count
+                            (max 1 (length shard-functions)))))
+               (header-file (expand-file-name "unit.h" directory))
+               (data-file (expand-file-name "data.c" directory))
+               (compc--d-default-idx d-default-idx)
+               (compc--d-impure-idx d-impure-idx)
+               (compc--d-ephemeral-idx d-ephemeral-idx)
+               (compc--args-many-functions
+                (compc--make-args-many-table functions))
+               (compc--c-name-map (compc--make-c-name-map functions))
+               (buffer-undo-list t)
+               (inhibit-modification-hooks t))
+    (make-directory directory t)
+    (with-temp-file header-file
+      (insert "#ifndef COMPHACK_UNIT_H\n#define COMPHACK_UNIT_H\n")
+      (compc-insert-line (format "#include \"%s\"" freloc-h))
+      (insert "\n")
+      (compc-insert-externs minimal)
+      (compc-insert-function-prototypes functions)
+      (insert "\n#endif /* COMPHACK_UNIT_H */\n"))
+    (with-temp-file data-file
+      (compc-insert-line "#include \"unit.h\"")
+      (insert "\n")
+      (compc-insert-reloc-arrays minimal)
+      (compc-insert-exports)
+      (compc-insert-data-blobs minimal)
+      (dolist (func entry-functions)
+        (insert (compc--function-source func))))
+    (let* ((sources (mapcar #'compc--function-source shard-functions))
+           (bins (compc--balance-function-sources sources shard-count))
+           (c-files (list data-file)))
+      (dotimes (i shard-count)
+        (let ((file (expand-file-name
+                     (format "shard-%02d.c" i) directory)))
+          (with-temp-file file
+            (compc-insert-line "#include \"unit.h\"")
+            (insert "\n")
+            (dolist (source (aref bins i))
+              (insert source)))
+          (push file c-files)))
+      (nreverse c-files))))
+
 ;;; Complete File Generation
 
 ;;;###autoload
@@ -1101,19 +1260,10 @@ Uses c-mode for proper GNU C coding style indentation."
           (compc--d-impure-idx d-impure-idx)
           (compc--d-ephemeral-idx d-ephemeral-idx)
           (compc--c-name-map nil)
-          (compc--args-many-functions (make-hash-table :test 'eq))
+          (compc--args-many-functions
+           (compc--make-args-many-table functions))
           (buffer-undo-list t)
           (inhibit-modification-hooks t))
-      (dolist (func functions)
-        (let* ((info (compc--function-arity-info func))
-               (sym (plist-get info :symbol))
-               (max-args (plist-get info :max))
-               (rest (plist-get info :rest))
-               (fixed (and (numberp max-args)
-                           (<= max-args 8)
-                           (not rest))))
-          (when (and sym (not fixed))
-            (puthash sym t compc--args-many-functions))))
       (setq compc--c-name-map
             (compc--make-c-name-map functions))
      ; (c-mode)
@@ -1136,34 +1286,7 @@ Uses c-mode for proper GNU C coding style indentation."
 
         (when user-funcs
           (insert "\n")
-          (dolist (func user-funcs)
-            (pcase-let* (((map :c-name) func)
-                         (c-name (compc--mapped-c-name c-name))
-                         (info (compc--function-arity-info func))
-                         (max-args (plist-get info :max))
-                         (has-rest-args (plist-get info :rest))
-                         (fixed-arity (and (numberp max-args)
-                                           (<= max-args 8)
-                                           (not has-rest-args)))
-                         (params (if fixed-arity
-                                     (if (zerop max-args)
-                                         "void"
-                                       (let ((args-list
-                                              (mapconcat
-                                               (lambda (i)
-                                                 (format "Lisp_Object arg%d" i))
-                                               (number-sequence 0 (1- max-args))
-                                               ", ")))
-                                         (if (> (length args-list) 50)
-                                             (mapconcat
-                                              (lambda (i)
-                                                (format "Lisp_Object arg%d" i))
-                                              (number-sequence 0 (1- max-args))
-                                              ",\n    ")
-                                           args-list)))
-                                   "ptrdiff_t nargs, Lisp_Object *args")))
-              (compc-insert-line
-               (format "Lisp_Object %s (%s);" c-name params))))
+          (compc-insert-function-prototypes user-funcs)
           (insert "\n"))
 
         (when user-funcs

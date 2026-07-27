@@ -2457,36 +2457,69 @@ PRE-LAMBDA and POST-LAMBDA are called in pre or post-order if non-nil."
          :type comp-vec
          :documentation "`comp-vec' of m-vars."))
 
+(defsubst comp--ssa-frame-slot-p (slot)
+  "Return non-nil when SLOT indexes the current function's frame."
+  (and (fixnump slot)
+       (>= slot (- (comp-func-vframe-size comp-func)))
+       (< slot (comp-func-frame-size comp-func))))
+
+(defun comp--ssa-rewrite-mvars (tree frame)
+  "Rewrite mvars in TREE to their current SSA values in FRAME.
+Modify conses in TREE in place and return the possibly replaced TREE."
+  (cond
+   ((comp-mvar-p tree)
+    (let ((slot (comp-mvar-slot tree)))
+      (if (comp--ssa-frame-slot-p slot)
+          (comp-vec-aref frame slot)
+        tree)))
+   ((consp tree)
+    (let ((tail tree))
+      ;; Iterate down list spines so long instruction argument lists do not
+      ;; consume Lisp call depth.  Recur only into nested trees.
+      (while (consp tail)
+        (setcar tail (comp--ssa-rewrite-mvars (car tail) frame))
+        (let ((next (cdr tail)))
+          (if (consp next)
+              (setq tail next)
+            (setcdr tail (comp--ssa-rewrite-mvars next frame))
+            (setq tail nil)))))
+    tree)
+   (t tree)))
+
+(defsubst comp--ssa-new-lvalue (insn frame slot)
+  "Install a new SSA lvalue for INSN at SLOT in FRAME."
+  (let ((mvar (make--comp--ssa-mvar :slot slot)))
+    (setf (comp-vec-aref frame slot) mvar
+          (cadr insn) mvar)))
+
 (defun comp--ssa-rename-insn (insn frame)
-  (cl-loop
-   for slot-n from (- (comp-func-vframe-size comp-func))
-              below (comp-func-frame-size comp-func)
-   do
-   (cl-flet ((targetp (x)
-               ;; Ret t if x is an mvar and target the correct slot number.
-               (and (comp-mvar-p x)
-                    (eql slot-n (comp-mvar-slot x))))
-             (new-lvalue ()
-               ;; If is an assignment make a new mvar and put it as l-value.
-               (let ((mvar (make--comp--ssa-mvar :slot slot-n)))
-                 (setf (comp-vec-aref frame slot-n) mvar
-                       (cadr insn) mvar))))
-     (pcase insn
-       (`(setimm ,(pred targetp) ,_imm)
-        (new-lvalue))
-       (`(,(pred comp--assign-op-p) ,(pred targetp) . ,_)
-        (let ((mvar (comp-vec-aref frame slot-n)))
-          (setf (cddr insn) (cl-nsubst-if mvar #'targetp (cddr insn))))
-        (new-lvalue))
-       (`(fetch-handler . ,_)
-        ;; Clobber all no matter what!
-        (setf (comp-vec-aref frame slot-n) (make--comp--ssa-mvar :slot slot-n)))
-       (`(phi ,n)
-        (when (equal n slot-n)
-          (new-lvalue)))
-       (_
-        (let ((mvar (comp-vec-aref frame slot-n)))
-          (setcdr insn (cl-nsubst-if mvar #'targetp (cdr insn)))))))))
+  (pcase insn
+    (`(setimm ,lval ,_imm)
+     (setf (cddr insn) (comp--ssa-rewrite-mvars (cddr insn) frame))
+     (when-let* (((comp-mvar-p lval))
+                 (slot (comp-mvar-slot lval))
+                 ((comp--ssa-frame-slot-p slot)))
+       (comp--ssa-new-lvalue insn frame slot)))
+    (`(,(pred comp--assign-op-p) ,lval . ,_)
+     ;; Rewrite the rvalues before installing the new lvalue, so references
+     ;; to its slot see the previous SSA value.
+     (setf (cddr insn) (comp--ssa-rewrite-mvars (cddr insn) frame))
+     (when-let* (((comp-mvar-p lval))
+                 (slot (comp-mvar-slot lval))
+                 ((comp--ssa-frame-slot-p slot)))
+       (comp--ssa-new-lvalue insn frame slot)))
+    (`(fetch-handler . ,_)
+     ;; Clobber all no matter what!
+     (cl-loop
+      for slot from (- (comp-func-vframe-size comp-func))
+               below (comp-func-frame-size comp-func)
+      do (setf (comp-vec-aref frame slot)
+               (make--comp--ssa-mvar :slot slot))))
+    (`(phi ,slot)
+     (when (comp--ssa-frame-slot-p slot)
+       (comp--ssa-new-lvalue insn frame slot)))
+    (_
+     (setcdr insn (comp--ssa-rewrite-mvars (cdr insn) frame)))))
 
 (defun comp--ssa-rename ()
   "Entry point to rename into SSA within the current function."
