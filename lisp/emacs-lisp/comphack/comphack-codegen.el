@@ -1423,18 +1423,25 @@ Returns the filename of the freloc header (e.g., \"generated/freloc-2b8d5670.h\"
          (tmp-file (expand-file-name (format ".%s.tmp.%d" freloc-filename (emacs-pid)) gen-dir))
          (guard-name (upcase (replace-regexp-in-string "[^A-Z0-9]" "_" freloc-filename))))
 
-    (unless (file-directory-p gen-dir)
-      (make-directory gen-dir t))
+    ;; Installed Emacs trees are normally read-only.  Their matching header
+    ;; was generated while Emacs itself was built, so reuse it instead of
+    ;; attempting to rewrite the installation on every native compilation.
+    ;; Keep regenerating in writable source trees so code-generator changes
+    ;; are reflected immediately during development.
+    (unless (and (file-exists-p freloc-file)
+                 (not (file-writable-p gen-dir)))
+      (unless (file-directory-p gen-dir)
+        (make-directory gen-dir t))
 
-    (with-temp-file tmp-file
-      (insert (format "#ifndef %s\n" guard-name))
-      (insert (format "#define %s\n\n" guard-name))
-      (insert (format "/* Generated for Emacs ABI hash: %s */\n\n" abi-hash))
-      (compc-insert-base-definitions)
-      (insert (format "\n#endif /* %s */\n" guard-name)))
+      (with-temp-file tmp-file
+        (insert (format "#ifndef %s\n" guard-name))
+        (insert (format "#define %s\n\n" guard-name))
+        (insert (format "/* Generated for Emacs ABI hash: %s */\n\n" abi-hash))
+        (compc-insert-base-definitions)
+        (insert (format "\n#endif /* %s */\n" guard-name)))
 
-    (rename-file tmp-file freloc-file t)
-    (comp-log (format "Generated %s" (concat "generated/" freloc-filename)))
+      (rename-file tmp-file freloc-file t)
+      (comp-log (format "Generated %s" (concat "generated/" freloc-filename))))
     (concat "generated/" freloc-filename)))
 
 (provide 'comphack-codegen)
