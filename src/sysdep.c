@@ -525,6 +525,61 @@ child_status_changed (pid_t child, int *status, int options)
   return get_child_status (child, status, WNOHANG | options, 0);
 }
 
+/* These primitives let the batch native compiler fork clean workers from a
+   single initialized Emacs.  They are deliberately internal: unlike normal
+   Emacs subprocesses, the children are copies of Emacs itself and are known
+   only to the native compiler's zygote driver.  */
+
+#if !defined MSDOS && !defined WINDOWSNT
+
+DEFUN ("comp--zygote-fork", Fcomp__zygote_fork, Scomp__zygote_fork,
+       0, 0, 0,
+       doc: /* Fork the current batch Emacs and return the child process ID.
+Return zero in the child.  This is an internal native compiler primitive.  */)
+  (void)
+{
+  /* Do not duplicate output which stdio has buffered before the fork.  */
+  if (fflush (NULL) != 0)
+    report_file_errno ("Flushing output before zygote fork", Qnil, errno);
+
+  pid_t pid = fork ();
+  if (pid < 0)
+    report_file_errno ("Forking native compiler worker", Qnil, errno);
+  return make_fixnum (pid);
+}
+
+DEFUN ("comp--zygote-wait", Fcomp__zygote_wait, Scomp__zygote_wait,
+       1, 2, 0,
+       doc: /* Return the exit status of zygote worker PID.
+If optional NOHANG is non-nil and PID is still running, return nil.
+Signal termination is reported using the shell convention 128+SIGNAL.
+This is an internal native compiler primitive.  */)
+  (Lisp_Object pid, Lisp_Object nohang)
+{
+  CHECK_FIXNUM (pid);
+  pid_t child = XFIXNUM (pid);
+  if (child <= 0)
+    args_out_of_range (pid, make_fixnum (1));
+
+  int status;
+  pid_t waited = get_child_status (child, &status,
+				   NILP (nohang) ? 0 : WNOHANG,
+				   NILP (nohang));
+  if (waited < 0)
+    report_file_errno ("Waiting for native compiler worker", pid, errno);
+  if (waited == 0)
+    return Qnil;
+  if (WIFEXITED (status))
+    return make_fixnum (WEXITSTATUS (status));
+  if (WIFSIGNALED (status))
+    return make_fixnum (128 + WTERMSIG (status));
+
+  /* We did not request stopped or continued children.  */
+  emacs_abort ();
+}
+
+#endif
+
 
 /*  Set up the terminal at the other end of a pseudo-terminal that
     we will be controlling an inferior through.
@@ -4760,4 +4815,8 @@ void
 syms_of_sysdep (void)
 {
   defsubr (&Sget_internal_run_time);
+#if !defined MSDOS && !defined WINDOWSNT
+  defsubr (&Scomp__zygote_fork);
+  defsubr (&Scomp__zygote_wait);
+#endif
 }

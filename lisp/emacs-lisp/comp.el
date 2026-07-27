@@ -3719,6 +3719,64 @@ variable \"NATIVE_DISABLED\" is set, only byte compile."
       (comp--write-bytecode-file eln-file)
       (setq command-line-args-left (cdr command-line-args-left)))))
 
+(defun comp--zygote-job-count ()
+  "Return the requested number of parallel zygote workers."
+  (let ((value (getenv "EMACS_ZYGOTE_JOBS")))
+    (if (and value (string-match-p "\\`[1-9][0-9]*\\'" value))
+        (string-to-number value)
+      1)))
+
+(defun comp--zygote-finished-worker (workers)
+  "Return the first finished worker from WORKERS, or nil.
+Each element of WORKERS is a cons (PID . FILE).  A finished worker is
+returned as (STATUS PID . FILE)."
+  (catch 'finished
+    (dolist (worker workers)
+      (let ((status (comp--zygote-wait (car worker) t)))
+        (when status
+          (throw 'finished (cons status worker)))))))
+
+(defun batch-byte+native-compile-zygote ()
+  "Compile command-line files in clean children forked from this Emacs.
+
+The parent initializes the compiler once and never compiles a file itself.
+Each child begins with the same pristine compiler state, compiles exactly
+one source file as `batch-byte+native-compile' would, and exits.  The
+environment variable EMACS_ZYGOTE_JOBS controls the maximum number of
+simultaneous children."
+  (unless noninteractive
+    (error "`batch-byte+native-compile-zygote' is only for batch Emacs"))
+  (unless (and (fboundp 'comp--zygote-fork)
+               (fboundp 'comp--zygote-wait))
+    (error "This Emacs does not support native compiler zygote workers"))
+  (comp-ensure-native-compiler)
+  (let ((pending command-line-args-left)
+        (maximum-workers (comp--zygote-job-count))
+        workers failures)
+    ;; Only children consume file arguments.
+    (setq command-line-args-left nil)
+    (while (or pending workers)
+      (while (and pending (< (length workers) maximum-workers))
+        (let* ((file (pop pending))
+               (pid (comp--zygote-fork)))
+          (if (zerop pid)
+              (progn
+                (setq command-line-args-left (list file))
+                (batch-byte+native-compile)
+                (kill-emacs 0))
+            (push (cons pid file) workers))))
+      (let ((finished (comp--zygote-finished-worker workers)))
+        (if (null finished)
+            (sleep-for 0.01)
+          (pcase-let ((`(,status ,pid . ,file) finished))
+            (setq workers (assq-delete-all pid workers))
+            (unless (zerop status)
+              (push (cons file status) failures))))))
+    (dolist (failure (nreverse failures))
+      (message "Zygote worker failed for %s with status %d"
+               (car failure) (cdr failure)))
+    (kill-emacs (if failures 1 0))))
+
 (defun native-compile-prune-cache ()
   "Remove .eln files that aren't applicable to the current Emacs invocation."
   (interactive)
