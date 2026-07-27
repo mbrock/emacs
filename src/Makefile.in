@@ -1008,6 +1008,11 @@ elnlisp := $(addprefix ${lispsource}/,${elnlisp}) $(lisp:.elc=.eln)
 ## compiled and haven't yet been compiled.  ELDONE holds the list
 ## of *.el files that were already native-compiled.
 NATIVE_COMPILATION_AOT = @NATIVE_COMPILATION_AOT@
+ifeq ($(NATIVE_COMP_ZYGOTE),yes)
+## The per-file %.eln rule ordinarily supplies this dependency.  The zygote
+## compiles the whole set in one recipe, so state it explicitly.
+../native-lisp: | emacs$(EXEEXT)
+endif
 ../native-lisp: | $(pdmp)
 	@if test ! -d $@; then \
 	  mkdir $@ && \
