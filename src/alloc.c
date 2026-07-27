@@ -1507,7 +1507,7 @@ make_interval (void)
 	    {
 	      struct interval_block *newi
 		= lisp_malloc (sizeof *newi, false, MEM_TYPE_NON_LISP);
-	      
+
 	      newi->next = interval_block;
 	      ASAN_POISON_INTERVAL_BLOCK (newi);
 	      interval_block = newi;
@@ -1901,10 +1901,10 @@ allocate_string (void)
 	{
 	  struct string_block *b = lisp_malloc (sizeof *b, false, MEM_TYPE_STRING);
 	  int i;
-	  
+
 	  b->next = string_blocks;
 	  string_blocks = b;
-	  
+
 	  for (i = STRING_BLOCK_SIZE - 1; i >= 0; --i)
 	    {
 	      s = b->strings + i;
@@ -1915,9 +1915,9 @@ allocate_string (void)
 	    }
 	  ASAN_POISON_STRING_BLOCK (b);
 	}
-      
+
       check_string_free_list ();
-      
+
       /* Pop a Lisp_String off the free-list.  */
       s = string_free_list;
       ASAN_UNPOISON_STRING (s);
@@ -1981,20 +1981,20 @@ allocate_string_data (struct Lisp_String *s,
       if (nbytes > LARGE_STRING_BYTES || immovable)
 	{
 	  size_t size = FLEXSIZEOF (struct sblock, data, needed);
-	  
+
 #ifdef DOUG_LEA_MALLOC
 	  if (!mmap_lisp_allowed_p ())
 	    mallopt (M_MMAP_MAX, 0);
 #endif
-	  
+
 	  b = lisp_malloc (size + GC_STRING_EXTRA, clearit, MEM_TYPE_NON_LISP);
 	  ASAN_POISON_SBLOCK_DATA (b, size);
-	  
+
 #ifdef DOUG_LEA_MALLOC
 	  if (!mmap_lisp_allowed_p ())
 	    mallopt (M_MMAP_MAX, MMAP_MAX_AREAS);
 #endif
-	  
+
 	  data = b->data;
 	  b->next = large_sblocks;
 	  b->next_free = data;
@@ -2003,7 +2003,7 @@ allocate_string_data (struct Lisp_String *s,
       else
 	{
 	  b = current_sblock;
-	  
+
 	  if (b == NULL
 	      || (SBLOCK_SIZE - GC_STRING_EXTRA
 		  < (char *) b->next_free - (char *) b + needed))
@@ -2011,20 +2011,20 @@ allocate_string_data (struct Lisp_String *s,
 	      /* Not enough room in the current sblock.  */
 	      b = lisp_malloc (SBLOCK_SIZE, false, MEM_TYPE_NON_LISP);
 	      ASAN_POISON_SBLOCK_DATA (b, SBLOCK_SIZE);
-	      
+
 	      data = b->data;
 	      b->next = NULL;
 	      b->next_free = data;
-	      
+
 	      if (current_sblock)
 		current_sblock->next = b;
 	      else
 		oldest_sblock = b;
 	      current_sblock = b;
 	    }
-	  
+
 	  data = b->next_free;
-	  
+
 	  if (clearit)
 	    {
 #if GC_ASAN_POISON_OBJECTS
