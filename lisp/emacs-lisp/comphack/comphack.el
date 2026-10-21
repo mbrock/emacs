@@ -36,7 +36,7 @@
       "unknown"))
 
 (defvar comphack-compiler-flags
-  '("-shared" "-fPIC" "-O0" "-w" "-fno-stack-protector")
+  '("-shared" "-fPIC" "-O1" "-w" "-fno-stack-protector")
   "Portable flags passed to the compiler when compiling C to .eln.")
 
 (defvar comphack--compiler-specific-flags-cache nil
@@ -298,21 +298,33 @@ Returns plist with only fields needed for C generation."
     ;; Extract all functions
     (maphash
      (lambda (c-name func)
-       (let ((blocks-list nil))
-         ;; Extract all basic blocks
-         (maphash
-          (lambda (bb-name bb)
-            (push (list :name bb-name
-                       :insns (mapcar #'comphack--clean-insn
-                                     (comp-block-insns bb))
-                       :in-edges (mapcar (lambda (e)
-                                          (comp-block-name (comp-edge-src e)))
-                                        (comp-block-in-edges bb))
-                       :out-edges (mapcar (lambda (e)
-                                           (comp-block-name (comp-edge-dst e)))
-                                         (comp-block-out-edges bb)))
-                  blocks-list))
-          (comp-func-blocks func))
+       (let* ((blocks-list nil)
+              (blocks (comp-func-blocks func))
+              (names (comp--collect-rev-post-order (gethash 'entry blocks)))
+              (reachable (make-hash-table :test #'eq)))
+         ;; Emit blocks in reverse postorder so each block follows its
+         ;; dominators.  At -O1 and above, Fil-C's instrumentation pass can
+         ;; crash when a value is used in a block laid out before the block
+         ;; that defines it.  Unreachable blocks follow in their old order.
+         (dolist (name names)
+           (puthash name t reachable))
+         (setq names (nreverse names))
+         (maphash (lambda (name _)
+                    (unless (gethash name reachable)
+                      (push name names)))
+                  blocks)
+         (dolist (bb-name (nreverse names))
+           (let ((bb (gethash bb-name blocks)))
+             (push (list :name bb-name
+                         :insns (mapcar #'comphack--clean-insn
+                                        (comp-block-insns bb))
+                         :in-edges (mapcar (lambda (e)
+                                             (comp-block-name (comp-edge-src e)))
+                                           (comp-block-in-edges bb))
+                         :out-edges (mapcar (lambda (e)
+                                              (comp-block-name (comp-edge-dst e)))
+                                            (comp-block-out-edges bb)))
+                   blocks-list)))
 
          (let ((doc (comp-func-doc func)))
            (push (list :c-name c-name
@@ -414,8 +426,7 @@ When KEEP-C-SOURCE is non-nil, preserve the intermediate C translation."
 
 (defun comphack--effective-compiler-flags ()
   "Return C compiler flags suitable for the configured compiler."
-  ;; GCC's flag preserves blob order.  Clang preserves source order at -O0
-  ;; already and rejects this GCC-only spelling.
+  ;; GCC's flag preserves blob order.  Clang rejects this GCC-only spelling.
   (if (string-match-p
        "clang" (file-name-nondirectory native-comp-comphack-cc))
       (delete "-fno-toplevel-reorder"

@@ -963,8 +963,18 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
       (compc-with-block
        (compc-insert-line "struct freloc_link_table *fn = freloc_link_table;")
 
-      ;; Check if function uses scratch variable
-      (let ((uses-scratch (cl-some
+      ;; A handler's setjmp returns again after a longjmp, and C leaves
+      ;; non-volatile locals modified since the setjmp indeterminate.  With
+      ;; optimization the frame slots live in registers and read stale values.
+      (let ((slot-type
+             (if (cl-some (lambda (block)
+                            (cl-some (lambda (insn)
+                                       (eq (car-safe insn) 'push-handler))
+                                     (plist-get block :insns)))
+                          blocks)
+                 "Lisp_Object volatile "
+               "Lisp_Object "))
+            (uses-scratch (cl-some
                            (lambda (block)
                              (cl-some (lambda (insn)
                                         (and (listp insn)
@@ -972,21 +982,21 @@ Uses narrow-to-region to stay within the function starting at FUNC-START."
                                       (plist-get block :insns)))
                            blocks)))
         (when uses-scratch
-          (compc-insert-line "Lisp_Object scratch;")))
+          (compc-insert-line (concat slot-type "scratch;")))
 
-      (when (> frame-size 0)
-        (insert "Lisp_Object ")
-        (let ((slots (mapconcat (lambda (i) (format "s%d" i))
-                                (number-sequence 0 (1- frame-size))
-                                ", ")))
-          (if (> (length slots) 60)
-              (insert (mapconcat (lambda (i) (format "s%d" i))
-                                 (number-sequence 0 (1- frame-size))
-                                 ",\n    "))
-            (insert slots)))
-        (insert ";")
-        (insert "\n")
-        (insert "\n"))
+        (when (> frame-size 0)
+          (insert slot-type)
+          (let ((slots (mapconcat (lambda (i) (format "s%d" i))
+                                  (number-sequence 0 (1- frame-size))
+                                  ", ")))
+            (if (> (length slots) 60)
+                (insert (mapconcat (lambda (i) (format "s%d" i))
+                                   (number-sequence 0 (1- frame-size))
+                                   ",\n    "))
+              (insert slots)))
+          (insert ";")
+          (insert "\n")
+          (insert "\n")))
 
       ;; For ARGS_MANY functions, extract all parameters from args array
       ;; This must happen before processing blocks to ensure all parameters
